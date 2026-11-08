@@ -16,18 +16,18 @@ jobs:
           xcodebuild -project Cicada.xcodeproj -target Cicada \
             -configuration Release \
             -destination 'generic/platform=iOS' \
-            -derivedDataPath build/derived \
+            CONFIGURATION_BUILD_DIR=build/out \
             CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM=""
 
       - name: Ad-hoc sign (helps TrollStore install)
         run: |
           codesign --force --sign - --timestamp=none \
-            build/derived/Build/Products/Release-iphoneos/Cicada.app || true
+            build/out/Cicada.app || true
 
       - name: Package IPA
         run: |
           mkdir -p Payload
-          cp -r build/derived/Build/Products/Release-iphoneos/Cicada.app Payload/
+          cp -r build/out/Cicada.app Payload/
           zip -r Cicada.ipa Payload
 
       - name: Upload IPA
