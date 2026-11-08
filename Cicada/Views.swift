@@ -92,7 +92,10 @@ final class AppModel: ObservableObject {
                     store.save(s)
                 }
             }
-            if !s.lines.isEmpty && AISettings.targetLang != "auto" {
+            // When simultaneous interpretation is off, skip translation entirely:
+            // no dst values are set (TranscriptRow hides dst when nil) and notes
+            // are generated from the original-language transcript lines below.
+            if AISettings.simultaneousInterpretation && !s.lines.isEmpty && AISettings.targetLang != "auto" {
                 for i in s.lines.indices {
                     s.lines[i].dst = try await ai.translate(s.lines[i].src, to: AISettings.targetLang)
                 }
@@ -326,6 +329,7 @@ struct SettingsView: View {
     @State private var chatModel = AISettings.chatModel
     @State private var transcribeModel = AISettings.transcribeModel
     @State private var targetLang = AISettings.targetLang
+    @State private var simultaneousInterpretation = AISettings.simultaneousInterpretation
     var body: some View {
         Form {
             Section("AI Service (OpenAI-compatible)") {
@@ -347,6 +351,8 @@ struct SettingsView: View {
                 Picker("Translate to", selection: $targetLang) {
                     Text("English").tag("en"); Text("Chinese").tag("zh"); Text("Japanese").tag("ja"); Text("Korean").tag("ko")
                 }.onChange(of: targetLang, perform: { _ in AISettings.targetLang = targetLang })
+                Toggle("同声传译", isOn: $simultaneousInterpretation)
+                    .onChange(of: simultaneousInterpretation, perform: { _ in AISettings.simultaneousInterpretation = simultaneousInterpretation })
                 if AISettings.hasKey { Button("Remove key", role: .destructive) { Keychain.remove(for: AISettings.keyKey); keyDraft = "" } }
             }
             Section("Privacy") {
