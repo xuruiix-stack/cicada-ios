@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import Combine
+import UIKit
 
 // MARK: - App model wiring record / transcribe / translate / notes
 
@@ -20,6 +21,17 @@ final class AppModel: ObservableObject {
     /// stays where the Stop control is; `selection` is set only when it finishes).
     @Published var recordingId: String?
 
+    /// Set by the background-task expiration handler: runPipeline checks it at
+    /// each step boundary and saves the partial progress reached so far.
+    private var pipelineCancelled = false
+    /// Active UIApplication background task for the pipeline, ended when it
+    /// finishes (or left to the expiration handler if the app is torn down).
+    private var backgroundTaskId: UIBackgroundTaskIdentifier = .invalid
+    /// True while a pipeline is in flight (set synchronously here, unlike
+    /// `busy`, which runPipeline sets after its first await — too late to close
+    /// the overlap race between two process() calls).
+    private var pipelineActive = false
+
     private var subs = Set<AnyCancellable>()
 
     init() {
@@ -32,6 +44,15 @@ final class AppModel: ObservableObject {
         store.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &subs)
+        // A session persisted as .running means the app was killed mid-pipeline
+        // (background time ran out or iOS terminated us): no Task is working on
+        // it anymore. Mark it failed so the Notes tab shows the reason instead
+        // of "Generating…" forever.
+        for i in store.sessions.indices where store.sessions[i].processingState == .running {
+            store.sessions[i].processingState = .failed
+            store.sessions[i].lastError = "Processing was interrupted before it finished."
+            store.save(store.sessions[i])
+        }
     }
 
     func startRecording() async {
@@ -73,37 +94,136 @@ final class AppModel: ObservableObject {
         store.save(s)
         selection = s.id
         // Run the AI pipeline automatically; process() is async and sets `busy`,
-        // so this returns immediately and Stop stays responsive.
+        // so this returns immediately and Stop stays responsive. process() wraps
+        // the work in a UIApplication background task: if the user locks the
+        // screen or switches away right after stopping, iOS grants a few extra
+        // seconds instead of suspending the app mid-pipeline.
         Task { await process(s) }
     }
 
     /// AI pipeline for a finished recording: transcribe → translate → notes.
+    /// Wraps runPipeline(_:) in a UIApplication background task so the pipeline
+    /// can finish after the user locks the screen or switches away; every caller
+    /// (Stop and the manual ↻ button) gets the background protection.
     func process(_ s: Session) async {
+        // Serialize: two pipelines at once (stop a second recording while the
+        // first still processes) would interleave saves on the two sessions.
+        // The dropped run leaves the session's persisted state as-is, so the
+        // Notes tab shows the honest hint / error and ↻ retries.
+        guard !pipelineActive else {
+            message = "Still processing the previous recording — try again in a moment."
+            return
+        }
+        pipelineActive = true
+        defer { pipelineActive = false }
+        let id = UIApplication.shared.beginBackgroundTask(withName: "cicada-pipeline") { [weak self] in
+            // Expiration: iOS grants no more background time and runs this on a
+            // background thread. Hop to the main actor and set the cancel flag;
+            // runPipeline checks it at its step boundaries, saves the partial
+            // progress reached so far and returns. process() below then ends
+            // the background task; if the pipeline hangs in an await, iOS
+            // suspends the app as usual (state was already persisted).
+            Task { @MainActor in self?.pipelineCancelled = true }
+        }
+        backgroundTaskId = id
+        pipelineCancelled = false
+        await runPipeline(s)
+        if backgroundTaskId == id {
+            backgroundTaskId = .invalid
+            if id != .invalid { UIApplication.shared.endBackgroundTask(id) }
+        }
+    }
+
+    /// The pipeline, restructured after the "real transcript but no notes" bug:
+    /// each step collects its own error and the next step still runs — a
+    /// transcribe or translate failure must never skip notes. Errors persist on
+    /// the session (Notes tab shows them; the alert is a bonus, not the record).
+    ///
+    /// Background survival: process() wraps this in a UIApplication background
+    /// task, so it keeps running briefly after the user leaves the app. Its
+    /// expiration handler sets pipelineCancelled; this function checks that flag
+    /// at each step boundary and saves the partial progress reached so far.
+    func runPipeline(_ s: Session) async {
         busy = true; defer { busy = false }
         guard AISettings.isConfigured else { message = "Set the API base URL and key in Settings › AI Service."; return }
-        do {
-            var s = s
-            if let f = s.audioFile, let url = store.audioURL(for: s) {
-                let text = try await ai.transcribe(audioURL: url)
+        var s = s
+        var errors: [String] = []
+        s.processingState = .running
+        s.lastError = nil
+        store.save(s)
+
+        // Step 1 — transcribe. Skipped when a server transcription has already
+        // succeeded once: a refresh after a notes-only failure must not re-upload
+        // every audio chunk. The liveText fallback line counts as transcript text
+        // for the notes step, but does not set `transcribed` — a server
+        // transcription can still improve on it.
+        if !s.transcribed, let url = store.audioURL(for: s) {
+            do {
+                let text: String
+                var failedChunks = 0
+                if ai.baseURLHost.contains("ant-ling.com") {
+                    let r = try await ai.transcribeChunked(audioURL: url)
+                    text = r.text; failedChunks = r.failedChunks
+                } else {
+                    text = try await ai.transcribe(audioURL: url)
+                }
                 if !text.isEmpty {
                     s.lines = [TranscriptLine(t: 0, speaker: 1, src: text)]
+                    s.transcribed = true
+                    s.failedChunkCount = failedChunks
                     // Persist the transcript immediately: if translate or notes
                     // fails below, the transcript is still on the session.
                     store.save(s)
+                } else {
+                    // No server text: the liveText fallback line (if any) is
+                    // what notes will run on. Record how many chunks failed so
+                    // the user can tell a fallback transcript from a real one.
+                    s.failedChunkCount = failedChunks
+                    if failedChunks > 0 {
+                        errors.append("Server transcription failed for all \(failedChunks) audio chunk(s).")
+                    }
+                    store.save(s)
                 }
+            } catch { errors.append("Transcription failed: \(error.localizedDescription)") }
+        }
+        if pipelineCancelled {
+            s.processingState = .failed
+            s.lastError = errors.isEmpty ? "Processing was interrupted." : errors.joined(separator: " · ")
+            store.save(s); return
+        }
+
+        // Step 2 — translate. When simultaneous interpretation is off, skip
+        // translation entirely: no dst values are set (TranscriptRow hides dst
+        // when nil) and notes are generated from the original-language lines.
+        // A translate failure must not stop notes: the line keeps its src text.
+        if AISettings.simultaneousInterpretation && !s.lines.isEmpty && AISettings.targetLang != "auto" {
+            for i in s.lines.indices {
+                do { s.lines[i].dst = try await ai.translate(s.lines[i].src, to: AISettings.targetLang) }
+                catch { errors.append("Translation failed: \(error.localizedDescription)"); break }
             }
-            // When simultaneous interpretation is off, skip translation entirely:
-            // no dst values are set (TranscriptRow hides dst when nil) and notes
-            // are generated from the original-language transcript lines below.
-            if AISettings.simultaneousInterpretation && !s.lines.isEmpty && AISettings.targetLang != "auto" {
-                for i in s.lines.indices {
-                    s.lines[i].dst = try await ai.translate(s.lines[i].src, to: AISettings.targetLang)
-                }
-            }
-            let transcript = s.lines.map { "Speaker \($0.speaker): \($0.src)" }.joined(separator: "\n")
-            if !transcript.isEmpty { s.notes = try await ai.meetingNotes(transcript: transcript) }
             store.save(s)
-        } catch { message = error.localizedDescription }
+        }
+        if pipelineCancelled {
+            s.processingState = .failed
+            s.lastError = errors.isEmpty ? "Processing was interrupted." : errors.joined(separator: " · ")
+            store.save(s); return
+        }
+
+        // Step 3 — notes. Runs whenever ANY transcript text exists (server
+        // transcript or the liveText fallback line); a step-1/2 error above
+        // does not skip it.
+        let transcript = s.lines.map { "Speaker \($0.speaker): \($0.src)" }.joined(separator: "\n")
+        if !transcript.isEmpty {
+            do { s.notes = try await ai.meetingNotes(transcript: transcript) }
+            catch { errors.append("Notes failed: \(error.localizedDescription)") }
+        } else if s.audioFile?.isEmpty == false {
+            errors.append("No transcript text to write notes from.")
+        }
+
+        s.lastError = errors.isEmpty ? nil : errors.joined(separator: " · ")
+        s.processingState = (s.lastError == nil) ? .done : .failed
+        store.save(s)
+        if let e = s.lastError { message = e }
     }
 
     func exportMarkdown(_ s: Session) -> String { TranscriptExport.markdown(s) }
@@ -229,7 +349,8 @@ struct RecordDetail: View {
                     ForEach(session.lines) { l in TranscriptRow(line: l) }
                     if session.lines.isEmpty { Text("No transcript yet.").foregroundStyle(Ink.secondary).padding(.top, 24) }
                 } else {
-                    NotesView(notes: session.notes)
+                    NotesView(notes: session.notes, state: session.processingState,
+                              lastError: session.lastError, failedChunks: session.failedChunkCount)
                 }
             }
             .padding(.horizontal, 20).padding(.top, 8)
@@ -293,8 +414,21 @@ struct TranscriptRow: View {
     }
 }
 
+/// Notes tab. Renders by the session's persisted processing state, so the user
+/// can tell not-run / running / failed apart without waiting on a one-shot alert.
 struct NotesView: View {
     let notes: MeetingNotes?
+    var state: ProcessingState = .idle
+    var lastError: String?
+    var failedChunks: Int = 0
+
+    /// Failure text for the UI: the persisted reason, or a generic line when a
+    /// step failed without a captured message.
+    private var reason: String {
+        if let e = lastError, !e.isEmpty { return e }
+        return "an unexpected error occurred"
+    }
+
     var body: some View {
         if let n = notes, !n.isEmpty {
             VStack(alignment: .leading, spacing: 14) {
@@ -316,7 +450,26 @@ struct NotesView: View {
                     }
                 }
             }.padding(.top, 16)
-        } else { Text("No notes yet. Tap ▶ to transcribe and write notes.").foregroundStyle(Ink.secondary).padding(.top, 24) }
+        } else if state == .running {
+            HStack(spacing: 8) {
+                ProgressView()
+                Text("Generating…").foregroundStyle(Ink.secondary)
+            }.padding(.top, 24)
+        } else if state == .failed {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Generation failed: \(reason)").foregroundStyle(Ink.accentText)
+                if failedChunks > 0 {
+                    Text("\(failedChunks) audio chunk(s) could not be transcribed and were skipped.").font(.footnote).foregroundStyle(Ink.secondary)
+                }
+                Text("Tap ↻ to retry.").foregroundStyle(Ink.secondary)
+            }.padding(.top, 24)
+        } else if state == .done {
+            // The pipeline ran and nothing failed, but the model's notes came
+            // back empty (e.g. only blank fields) — not the same as never-run.
+            Text("Notes came back empty. Tap ↻ to retry.").foregroundStyle(Ink.secondary).padding(.top, 24)
+        } else {
+            Text("No notes yet. Tap ▶ to transcribe and write notes.").foregroundStyle(Ink.secondary).padding(.top, 24)
+        }
     }
 }
 
