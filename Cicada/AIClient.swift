@@ -251,9 +251,9 @@ final class AIClient: ObservableObject {
                 guard let outBuf = AVAudioPCMBuffer(pcmFormat: out, frameCapacity: cap) else { break }
                 var fed = false; var cerr: NSError?
                 conv.convert(to: outBuf, error: &cerr) { _, status in
-                    if fed { status.pointee = .noDataNow; return (nil, .noDataNow) }
+                    if fed { status.pointee = .noDataNow; return nil }
                     fed = true; status.pointee = .haveData
-                    return (inBuf, .haveData)
+                    return inBuf
                 }
                 guard fed, cerr == nil, outBuf.frameLength > 0 else { break }
                 converted = outBuf
@@ -270,7 +270,7 @@ final class AIClient: ObservableObject {
                       let part = AVAudioPCMBuffer(pcmFormat: out, frameCapacity: AVAudioFrameCount(n)) else { break }
                 part.frameLength = AVAudioFrameCount(n)
                 if let s = converted.floatChannelData?[0], let d = part.floatChannelData?[0] {
-                    d.update(from: UnsafeBufferPointer(start: s + offset, count: n))
+                    d.update(from: s + offset, count: n)
                 }
                 try w.write(from: part)
                 inChunk += n; offset += n
