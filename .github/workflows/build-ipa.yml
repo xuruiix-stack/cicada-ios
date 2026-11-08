@@ -11,6 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Lint project file
+        run: plutil -lint Cicada.xcodeproj/project.pbxproj
+
       - name: Build (no signing)
         run: |
           xcodebuild -project Cicada.xcodeproj -target Cicada \
