@@ -1,68 +1,341 @@
+// !$*UTF8*$!
 {
 	archiveVersion = 1;
-	classes = {};
-	objectVersion = 60;
+	classes = {
+	};
+	objectVersion = 56;
 	objects = {
 
 /* Begin PBXBuildFile section */
-		A91310B90AE44241A8E60290 /* CicadaApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 50789D4B4D804E6D8DA5E1F8 /* CicadaApp.swift */; };
-		64E280B5E06D42688794CAA3 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05607EF7906344378E147E8C /* Theme.swift */; };
-		50419084B5674ABDAD1210A9 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6111D9B248D245E6B40BB962 /* Models.swift */; };
-		8DF59FC4A93B40D2A9B02C6A /* AIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E87336FBE554F8080498802 /* AIClient.swift */; };
-		C2CB8DC7200547C3AB52CA7E /* Store.swift in Sources */ = {isa = PBXBuildFile; fileRef = D3A6C56007254F9B845D2532 /* Store.swift */; };
-		41F914383356483493812B1C /* Recorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E2B382025D242D9A9C934E2 /* Recorder.swift */; };
-		C5FF58E31CC949A7BF02894D /* Views.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3F63C7CC33C4B21993E59BC /* Views.swift */; };
+		13E3591990124504B42CD6B9 /* CicadaApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1804A6F55D84035822C3D12 /* CicadaApp.swift */; };
+		BEA5A09EDA634D18A0100670 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = E109BD05136247DE8D15D97A /* Theme.swift */; };
+		31592C81D2C747539939384F /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A9AF782BB7C45549D11EF45 /* Models.swift */; };
+		C622F03352D84F6CA67E872E /* AIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = E132D023574F4CAEB4264755 /* AIClient.swift */; };
+		0BEFECCFCABA4BBD8177979F /* Store.swift in Sources */ = {isa = PBXBuildFile; fileRef = 039353809ADA4750AF6D22BE /* Store.swift */; };
+		DB7221ABF07F4C85AB6E1AA6 /* Recorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D8A9F7A29CE46D2BE4B39AA /* Recorder.swift */; };
+		6229341AC58F4754A67ADC15 /* Views.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6A21D8612234FD3B2A4DBFA /* Views.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		50789D4B4D804E6D8DA5E1F8 /* CicadaApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CicadaApp.swift; sourceTree = "<group>"; };
-		05607EF7906344378E147E8C /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
-		6111D9B248D245E6B40BB962 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
-		5E87336FBE554F8080498802 /* AIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIClient.swift; sourceTree = "<group>"; };
-		D3A6C56007254F9B845D2532 /* Store.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Store.swift; sourceTree = "<group>"; };
-		0E2B382025D242D9A9C934E2 /* Recorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Recorder.swift; sourceTree = "<group>"; };
-		F3F63C7CC33C4B21993E59BC /* Views.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Views.swift; sourceTree = "<group>"; };
-		94482B62EFF5422E9E5613DC /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
-		2337C7CE71954086A056E4FB /* Cicada.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Cicada.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		5D02FD9E44E941AD91575C83 /* Cicada.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Cicada.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B1804A6F55D84035822C3D12 /* CicadaApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CicadaApp.swift; sourceTree = "<group>"; };
+		E109BD05136247DE8D15D97A /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
+		0A9AF782BB7C45549D11EF45 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		E132D023574F4CAEB4264755 /* AIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIClient.swift; sourceTree = "<group>"; };
+		039353809ADA4750AF6D22BE /* Store.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Store.swift; sourceTree = "<group>"; };
+		8D8A9F7A29CE46D2BE4B39AA /* Recorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Recorder.swift; sourceTree = "<group>"; };
+		D6A21D8612234FD3B2A4DBFA /* Views.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Views.swift; sourceTree = "<group>"; };
+		DE4BFEC7D6174118BB8BE473 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
-		B1AD4A3315A74E3498EB3055 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		16444C13E7FD4824A3CBF55E /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		9AE182AC645F4A27AB158D3B = {isa = PBXGroup; children = (50789D4B4D804E6D8DA5E1F8 /* CicadaApp.swift */, 05607EF7906344378E147E8C /* Theme.swift */, 6111D9B248D245E6B40BB962 /* Models.swift */, 5E87336FBE554F8080498802 /* AIClient.swift */, D3A6C56007254F9B845D2532 /* Store.swift */, 0E2B382025D242D9A9C934E2 /* Recorder.swift */, F3F63C7CC33C4B21993E59BC /* Views.swift */, 94482B62EFF5422E9E5613DC /* Info.plist */); path = Cicada; sourceTree = "<group>"; };
-		886619EB8B524789AB20E224 = {isa = PBXGroup; children = (2337C7CE71954086A056E4FB /* Cicada.app */); name = Products; sourceTree = "<group>"; };
-		9DF22386649D40F1AC950396 = {isa = PBXGroup; children = (9AE182AC645F4A27AB158D3B /* Cicada */, 886619EB8B524789AB20E224 /* Products */); sourceTree = "<group>"; };
+		24CDC90559B340AAA2CB6F1A = {
+			isa = PBXGroup;
+			children = (
+				3625646F2A3143D7ABDD6C6F /* Cicada */,
+				60E359660D9648789370CDB9 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		60E359660D9648789370CDB9 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				5D02FD9E44E941AD91575C83 /* Cicada.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		3625646F2A3143D7ABDD6C6F /* Cicada */ = {
+			isa = PBXGroup;
+			children = (
+				B1804A6F55D84035822C3D12 /* CicadaApp.swift */,
+				E109BD05136247DE8D15D97A /* Theme.swift */,
+				0A9AF782BB7C45549D11EF45 /* Models.swift */,
+				E132D023574F4CAEB4264755 /* AIClient.swift */,
+				039353809ADA4750AF6D22BE /* Store.swift */,
+				8D8A9F7A29CE46D2BE4B39AA /* Recorder.swift */,
+				D6A21D8612234FD3B2A4DBFA /* Views.swift */,
+				DE4BFEC7D6174118BB8BE473 /* Info.plist */,
+			);
+			path = Cicada;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		C4CA2A72C22D402C9F33E2DD = {isa = PBXNativeTarget; buildConfigurationList = 9909AB8D354047BCAFD97047 /* Build configuration list for PBXNativeTarget "Cicada" */; buildPhases = (A0B73BCAD02A4B8EB083D138 /* Sources */, B1AD4A3315A74E3498EB3055 /* Frameworks */, 05C67E6E22744DEA819F16D9 /* Resources */); buildRules = (); dependencies = (); name = Cicada; productName = Cicada; productReference = 2337C7CE71954086A056E4FB /* Cicada.app */; productType = "com.apple.product-type.application"; };
+		9200DBB0A98747A0879B9D57 /* Cicada */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 677BD314476444A68342A459 /* Build configuration list for PBXNativeTarget "Cicada" */;
+			buildPhases = (
+				67F3D3D62DF64D80BABD6BDA /* Sources */,
+				16444C13E7FD4824A3CBF55E /* Frameworks */,
+				A9ECE344A28242298A220FBC /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Cicada;
+			productName = Cicada;
+			productReference = 5D02FD9E44E941AD91575C83 /* Cicada.app */;
+			productType = "com.apple.product-type.application";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
-		3BE07808569545BB9975AB4A = {isa = PBXProject; attributes = {BuildIndependentTargetsInParallel = 1; LastUpgradeCheck = 1600; TargetAttributes = {C4CA2A72C22D402C9F33E2DD = {CreatedOnToolsVersion = 16.0; }}; }; buildConfigurationList = 7A283199C308491D87874120 /* Build configuration list for PBXProject "Cicada" */; compatibilityVersion = "Xcode 16.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = 9DF22386649D40F1AC950396; productRefGroup = 886619EB8B524789AB20E224 /* Products */; projectDirPath = ""; projectRoot = ""; targets = (C4CA2A72C22D402C9F33E2DD); };
+		74545E13DC5642F492D739F8 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					9200DBB0A98747A0879B9D57 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = BCF9A74CB1C64EFD971C34AA /* Build configuration list for PBXProject "Cicada" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 24CDC90559B340AAA2CB6F1A;
+			productRefGroup = 60E359660D9648789370CDB9 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				9200DBB0A98747A0879B9D57 /* Cicada */,
+			);
+		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		05C67E6E22744DEA819F16D9 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		A9ECE344A28242298A220FBC /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		A0B73BCAD02A4B8EB083D138 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A91310B90AE44241A8E60290 /* CicadaApp.swift in Sources */, 64E280B5E06D42688794CAA3 /* Theme.swift in Sources */, 50419084B5674ABDAD1210A9 /* Models.swift in Sources */, 8DF59FC4A93B40D2A9B02C6A /* AIClient.swift in Sources */, C2CB8DC7200547C3AB52CA7E /* Store.swift in Sources */, 41F914383356483493812B1C /* Recorder.swift in Sources */, C5FF58E31CC949A7BF02894D /* Views.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
+		67F3D3D62DF64D80BABD6BDA /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				13E3591990124504B42CD6B9 /* CicadaApp.swift in Sources */,
+				BEA5A09EDA634D18A0100670 /* Theme.swift in Sources */,
+				31592C81D2C747539939384F /* Models.swift in Sources */,
+				C622F03352D84F6CA67E872E /* AIClient.swift in Sources */,
+				0BEFECCFCABA4BBD8177979F /* Store.swift in Sources */,
+				DB7221ABF07F4C85AB6E1AA6 /* Recorder.swift in Sources */,
+				6229341AC58F4754A67ADC15 /* Views.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
-		A285DC819D2041318E952B03 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Cicada/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 16.4; MARKETING_VERSION = 1.0.0; PRODUCT_BUNDLE_IDENTIFIER = com.wquguru.cicada; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; }; name = Debug; };
-		C811A8D350214917BBDB3DAD /* Release */ = {isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Cicada/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 16.4; MARKETING_VERSION = 1.0.0; PRODUCT_BUNDLE_IDENTIFIER = com.wquguru.cicada; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; }; name = Release; };
-		3549802D0E6E4C27A3457248 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; DEBUG_INFORMATION_FORMAT = dwarf; GCC_OPTIMIZATION_LEVEL = 0; ONLY_ACTIVE_ARCH = YES; SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
-		FA06FD320EEC48E6ACC5DF41 /* Release */ = {isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; ENABLE_NS_ASSERTIONS = NO; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; VALIDATE_PRODUCT = YES; }; name = Release; };
+		44977AF1E17046978A16EA43 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+									"DEBUG=1",
+									"$(inherited)",
+								);
+				ONLY_ACTIVE_ARCH = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.4;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+			};
+			name = Debug;
+		};
+		67D2857599AB44E09C99462E /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.4;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+			};
+			name = Release;
+		};
+		860B781EE8194BDD8F650309 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Cicada/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.4;
+				LD_RUNPATH_SEARCH_PATHS = (
+									"$(inherited)",
+									"@executable_path/Frameworks",
+								);
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.wquguru.cicada;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A5DBBB7F3C264F7C91FF3F2F /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Cicada/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.4;
+				LD_RUNPATH_SEARCH_PATHS = (
+									"$(inherited)",
+									"@executable_path/Frameworks",
+								);
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.wquguru.cicada;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		9909AB8D354047BCAFD97047 /* Build configuration list for PBXNativeTarget "Cicada" */ = {isa = XCConfigurationList; buildConfigurations = (A285DC819D2041318E952B03 /* Debug */, C811A8D350214917BBDB3DAD /* Release */); defaultConfigurationIsVisible = 0; };
-		7A283199C308491D87874120 /* Build configuration list for PBXProject "Cicada" */ = {isa = XCConfigurationList; buildConfigurations = (3549802D0E6E4C27A3457248 /* Debug */, FA06FD320EEC48E6ACC5DF41 /* Release */); defaultConfigurationIsVisible = 0; };
+		BCF9A74CB1C64EFD971C34AA /* Build configuration list for PBXProject "Cicada" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				44977AF1E17046978A16EA43 /* Debug */,
+				67D2857599AB44E09C99462E /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		677BD314476444A68342A459 /* Build configuration list for PBXNativeTarget "Cicada" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				860B781EE8194BDD8F650309 /* Debug */,
+				A5DBBB7F3C264F7C91FF3F2F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 /* End XCConfigurationList section */
 	};
-	rootObject = 3BE07808569545BB9975AB4A /* Project object */;
+	rootObject = 74545E13DC5642F492D739F8 /* Project object */;
 }
