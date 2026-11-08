@@ -23,6 +23,16 @@ struct MeetingNotes: Codable, Equatable {
     struct Topic: Codable, Equatable { var title: String; var points: [String] = [] }
 }
 
+/// Where a session stands in the transcribe → translate → notes pipeline.
+/// Persisted so the Notes tab can tell not-run / running / failed apart after
+/// a relaunch, not just while the one-shot alert is on screen.
+enum ProcessingState: String, Codable {
+    case idle          // nothing has run yet
+    case running       // pipeline in progress ("Generating…")
+    case done          // notes (or at least the transcript) completed
+    case failed        // a step failed; lastError holds the reason
+}
+
 struct Session: Identifiable, Codable, Equatable {
     var id: String = UUID().uuidString
     var title: String = ""
@@ -31,7 +41,56 @@ struct Session: Identifiable, Codable, Equatable {
     var lines: [TranscriptLine] = []
     var notes: MeetingNotes?
     var audioFile: String?   // relative filename under Documents/Recordings
+    // Pipeline state, persisted with the session. Synthesized Codable ignores
+    // default values (a missing key throws for non-optional fields), which would
+    // make every pre-existing session JSON fail to decode and disappear from
+    // the list — hence the hand-written init(from:) in the extension below.
+    var processingState: ProcessingState = .idle
+    /// True once a server transcription has succeeded for this session — lets a
+    /// refresh skip re-uploading all audio chunks and go straight to notes.
+    var transcribed = false
+    /// Persisted reason for the last failed step, shown on the Notes tab.
+    var lastError: String?
+    /// Chunks that failed transcription even after their retry (Ling path).
+    var failedChunkCount = 0
     var duration: Double { endedAt.map { $0.timeIntervalSince(startedAt) } ?? 0 }
+}
+
+extension Session {
+    enum CodingKeys: String, CodingKey {
+        case id, title, startedAt, endedAt, lines, notes, audioFile
+        case processingState, transcribed, lastError, failedChunkCount
+    }
+    /// Tolerant decoding: every field falls back to its default, so session
+    /// files written before the pipeline-state fields existed keep loading.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+        startedAt = try c.decodeIfPresent(Date.self, forKey: .startedAt) ?? Date()
+        endedAt = try c.decodeIfPresent(Date.self, forKey: .endedAt)
+        lines = try c.decodeIfPresent([TranscriptLine].self, forKey: .lines) ?? []
+        notes = try c.decodeIfPresent(MeetingNotes.self, forKey: .notes)
+        audioFile = try c.decodeIfPresent(String.self, forKey: .audioFile)
+        processingState = try c.decodeIfPresent(ProcessingState.self, forKey: .processingState) ?? .idle
+        transcribed = try c.decodeIfPresent(Bool.self, forKey: .transcribed) ?? false
+        lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
+        failedChunkCount = try c.decodeIfPresent(Int.self, forKey: .failedChunkCount) ?? 0
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(title, forKey: .title)
+        try c.encode(startedAt, forKey: .startedAt)
+        try c.encodeIfPresent(endedAt, forKey: .endedAt)
+        try c.encode(lines, forKey: .lines)
+        try c.encodeIfPresent(notes, forKey: .notes)
+        try c.encodeIfPresent(audioFile, forKey: .audioFile)
+        try c.encode(processingState, forKey: .processingState)
+        try c.encode(transcribed, forKey: .transcribed)
+        try c.encodeIfPresent(lastError, forKey: .lastError)
+        try c.encode(failedChunkCount, forKey: .failedChunkCount)
+    }
 }
 
 enum TranscriptExport {
