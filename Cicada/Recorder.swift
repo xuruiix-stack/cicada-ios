@@ -98,10 +98,10 @@ final class Recorder: NSObject, ObservableObject {
         guard let cap = AVAudioPCMBuffer(pcmFormat: sinkFormat, frameCapacity: capFrames) else { return }
         var fed = false; var err: NSError?
         converter.convert(to: cap, error: &err) { _, inputStatus in
-            if fed { inputStatus.pointee = .noDataNow; return (nil, .noDataNow) }
+            if fed { inputStatus.pointee = .noDataNow; return nil }
             fed = true
             inputStatus.pointee = .haveData
-            return (buffer, .haveData)
+            return buffer
         }
         guard fed, err == nil, cap.frameLength > 0 else { return }
         do { try file.write(from: cap) }
