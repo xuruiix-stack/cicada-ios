@@ -70,11 +70,14 @@ enum Keychain {
 }
 
 enum AIError: LocalizedError {
-    case notConfigured, invalidResponse, http(Int, String?), underlying(Error)
+    case notConfigured, invalidResponse, unparsableNotes, http(Int, String?), underlying(Error)
     var errorDescription: String? {
         switch self {
         case .notConfigured: return "Set the API base URL and key in Settings › AI Service."
         case .invalidResponse: return "The service returned an unexpected response."
+        // Notes step: the chat replied, but not with usable JSON — say so
+        // instead of silently rendering empty notes.
+        case .unparsableNotes: return "The model's notes reply was not valid JSON."
         // Show the server's own reason (Ling/OpenRouter reject wrong models, formats
         // and over-long audio with 400 + message) instead of a bare status code.
         case .http(let c, let detail):
@@ -128,6 +131,13 @@ final class AIClient: ObservableObject {
     func chat(system: String, user: String, json: Bool = false) async throws -> String {
         let url = try endpoint("chat/completions")
         var r = request(to: url); r.httpMethod = "POST"
+        // Long transcripts (a 4+ minute recording joined into one prompt) make
+        // the notes/translate generation slow; the default 90 s timeout
+        // (CicadaTuning.notesTimeout) aborts the call mid-generation and the
+        // notes step fails. Scale the timeout with the prompt instead of
+        // silently dropping the transcript: 90 s + 5 s per 100 characters,
+        // capped at 5 minutes. Short prompts keep the original 90 s.
+        r.timeoutInterval = min(300, CicadaTuning.notesTimeout + Double(user.count) / 20)
         let body: [String: Any] = ["model": AISettings.chatModel,
             "messages": [["role": "system", "content": system], ["role": "user", "content": user]],
             "temperature": 0.3, "max_tokens": CicadaTuning.notesMaxTokens]
@@ -142,33 +152,64 @@ final class AIClient: ObservableObject {
         _ = json; return content
     }
 
+    /// How a chunked Ling transcription went: the joined text of the chunks
+    /// that succeeded, plus how many chunks failed even after their retry.
+    /// One bad chunk must degrade the result, never abort the transcription.
+    struct ChunkedTranscription {
+        var text: String
+        var failedChunks: Int
+    }
+
     /// Speech-to-text via /audio/transcriptions (multipart file upload), made
     /// provider-aware (facts verified against the providers' docs, see below).
     func transcribe(audioURL: URL, language: String? = nil) async throws -> String {
         if baseURLHost.contains("ant-ling.com") {
-            // Ling (api.ant-ling.com) /v1/audio/transcriptions accepts ONLY model
-            // Ming-3.0-asr-tiny, ONLY .wav (not .m4a), ≤10 MB and ≤30 s per call.
-            // Convert the recorded .m4a to 16 kHz mono LinearPCM .wav on device,
-            // split into ≤30 s chunks, transcribe each, join the texts.
-            let chunks = try lingWavChunks(from: audioURL)
-            defer {
-                for c in chunks { try? FileManager.default.removeItem(at: c) }
-                if let d = chunks.first?.deletingLastPathComponent() {
-                    try? FileManager.default.removeItem(at: d)
-                }
-            }
-            var texts: [String] = []
-            for c in chunks {
-                let t = try await transcribeFile(c, model: lingTranscribeModel, language: language)
-                if !t.isEmpty { texts.append(t) }
-            }
-            return texts.joined(separator: " ")
+            // One bad chunk must not abort the whole transcription: retry each
+            // failed chunk once, then skip it and keep the successful texts.
+            // The failed count surfaces on the session (Views.swift runPipeline).
+            let r = try await transcribeChunked(audioURL: audioURL, language: language)
+            return r.text
         }
         return try await transcribeFile(audioURL, model: transcribeModelForProvider, language: language)
     }
 
+    /// Chunked Ling path with per-chunk fault tolerance. Chunks that fail
+    /// twice are skipped and counted, not thrown.
+    func transcribeChunked(audioURL: URL, language: String? = nil) async throws -> ChunkedTranscription {
+        // Ling (api.ant-ling.com) /v1/audio/transcriptions accepts ONLY model
+        // Ming-3.0-asr-tiny, ONLY .wav (not .m4a), ≤10 MB and ≤30 s per call.
+        // Convert the recorded .m4a to 16 kHz mono LinearPCM .wav on device,
+        // split into ≤30 s chunks, transcribe each, join the texts.
+        let chunks = try lingWavChunks(from: audioURL)
+        defer {
+            for c in chunks { try? FileManager.default.removeItem(at: c) }
+            if let d = chunks.first?.deletingLastPathComponent() {
+                try? FileManager.default.removeItem(at: d)
+            }
+        }
+        var texts: [String] = []
+        var failedChunks = 0
+        for c in chunks {
+            do {
+                let t = try await transcribeFile(c, model: lingTranscribeModel, language: language)
+                if !t.isEmpty { texts.append(t) }
+            } catch {
+                // Retry once — transient network/server hiccups are the common
+                // case on a 4+ minute recording's 8+ sequential chunk calls.
+                do {
+                    let t = try await transcribeFile(c, model: lingTranscribeModel, language: language)
+                    if !t.isEmpty { texts.append(t) }
+                } catch {
+                    failedChunks += 1
+                }
+            }
+        }
+        return ChunkedTranscription(text: texts.joined(separator: " "), failedChunks: failedChunks)
+    }
+
     /// Host of the configured base URL (scheme optional, as typed in Settings).
-    private var baseURLHost: String {
+    /// Internal: AppModel checks it to pick the chunked Ling transcription path.
+    var baseURLHost: String {
         var b = AISettings.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if !b.contains("://") { b = "https://" + b }
         return (URL(string: b)?.host ?? b).lowercased()
@@ -293,22 +334,134 @@ final class AIClient: ObservableObject {
                        user: "Translate to \(lang):\n\(text)")
     }
 
-    /// Structured meeting notes: summary, topics, conclusions, action items.
-    func meetingNotes(transcript: String) async throws -> MeetingNotes {
-        let raw = try await chat(
-            system: "You write structured meeting notes. Reply with JSON only: {\"summary\":string,\"topics\":[{\"title\":string,\"points\":[string]}],\"conclusions\":[string],\"actionItems\":[{\"text\":string,\"owner\":string|null}]}",
-            user: transcript, json: true)
+    /// Best-effort notes JSON extraction from a chat reply that may not be pure
+    /// JSON: ```json fences, leading/trailing prose, or truncation. Returns nil
+    /// when no plausible JSON object is found at all.
+    private func extractNotesJSON(from raw: String) -> [String: Any]? {
+        var t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         // Chat models often wrap JSON in ```json … ``` fences despite the prompt;
         // strip them before parsing.
-        var t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.hasPrefix("```") {
             t = t.split(separator: "\n", omittingEmptySubsequences: false)
                 .dropFirst().joined(separator: "\n")
             if t.hasSuffix("```") { t = String(t.dropLast(3)) }
             t = t.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        guard let d = t.data(using: .utf8),
-              let j = try JSONSerialization.jsonObject(with: d) as? [String: Any] else { throw AIError.invalidResponse }
+        if let d = t.data(using: .utf8),
+           let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+            return j
+        }
+        // The reply is not pure JSON. Two salvage paths, best first:
+        // 1. the first balanced {...} region — JSON surrounded by prose;
+        // 2. from the first "{" to the end, cut back and re-closed — JSON
+        //    truncated by max_tokens (no balanced region exists in that case).
+        if let sub = firstJSONObject(in: t),
+           let d = sub.data(using: .utf8),
+           let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+            return j
+        }
+        if let start = t.firstIndex(of: "{"),
+           let j = salvageNotesJSON(from: String(t[start...])) {
+            return j
+        }
+        return nil
+    }
+
+    /// The first outermost {...} region of `s`, scanning with brace depth and
+    /// skipping braces inside double-quoted strings (with \" escapes), or nil.
+    private func firstJSONObject(in s: String) -> String? {
+        var start: String.Index?
+        var depth = 0
+        var inString = false
+        var i = s.startIndex
+        while i < s.endIndex {
+            let c = s[i]
+            if inString {
+                if c == "\\" {
+                    // Skip the escaped character so \" can't end the string.
+                    i = s.index(after: i)
+                    if i >= s.endIndex { break }
+                } else if c == "\"" {
+                    inString = false
+                }
+            } else {
+                if c == "\"" { inString = true }
+                else if c == "{" {
+                    if depth == 0 { start = i }
+                    depth += 1
+                } else if c == "}" {
+                    depth -= 1
+                    if depth == 0, let st = start {
+                        return String(s[st...i])
+                    }
+                    if depth < 0 { return nil } // unbalanced: no valid object
+                }
+            }
+            i = s.index(after: i)
+        }
+        return nil
+    }
+
+    /// Salvage a JSON object from a reply truncated mid-stream (max_tokens cut
+    /// it off mid-string or mid-array): try cutting the text at successively
+    /// earlier token boundaries — every position that ends outside a string —
+    /// closing the containers still open there and parsing. The first candidate
+    /// that parses wins; the parse itself is the validator, so there is no
+    /// fragile manual token surgery. Returns nil if nothing salvageable remains.
+    private func salvageNotesJSON(from s: String) -> [String: Any]? {
+        let chars = Array(s)
+        guard !chars.isEmpty else { return nil }
+        // One scan: after each character, the container stack and whether the
+        // scan is inside a string at that point.
+        var inString = false
+        var escaped = false
+        var stack: [Character] = []
+        var stacks: [[Character]] = []
+        var inStrings: [Bool] = []
+        for c in chars {
+            if escaped { escaped = false }
+            else if inString {
+                if c == "\\" { escaped = true }
+                else if c == "\"" { inString = false }
+            } else {
+                if c == "\"" { inString = true }
+                else if c == "{" || c == "[" { stack.append(c) }
+                else if c == "}" || c == "]" { if !stack.isEmpty { stack.removeLast() } }
+            }
+            stacks.append(stack)      // value type: copies the current stack
+            inStrings.append(inString)
+        }
+        // Candidates, longest prefix first: every position ending outside a
+        // string. (A cut inside a string would leave a dangling fragment; the
+        // previous outside-string position is exactly the cut that drops it.)
+        let candidates = (0..<chars.count).filter { !inStrings[$0] }
+        var tried = 0
+        for i in candidates.reversed() {
+            var t = String(chars[...i]).trimmingCharacters(in: .whitespacesAndNewlines)
+            // A trailing , or : is never valid JSON; drop it. Neither touches
+            // the container stack, so the snapshot stays valid.
+            while t.hasSuffix(",") || t.hasSuffix(":") {
+                t = String(t.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            // Close the containers still open at this cut, innermost first.
+            for c in stacks[i].reversed() { t.append(c == "[" ? "]" : "}") }
+            if let d = t.data(using: .utf8),
+               let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+               !j.isEmpty {
+                return j
+            }
+            tried += 1
+            if tried > 512 { break }   // bounded work on pathological replies
+        }
+        return nil
+    }
+
+    /// Structured meeting notes: summary, topics, conclusions, action items.
+    func meetingNotes(transcript: String) async throws -> MeetingNotes {
+        let raw = try await chat(
+            system: "You write structured meeting notes. Reply with JSON only: {\"summary\":string,\"topics\":[{\"title\":string,\"points\":[string]}],\"conclusions\":[string],\"actionItems\":[{\"text\":string,\"owner\":string|null}]}",
+            user: transcript, json: true)
+        guard let j = extractNotesJSON(from: raw) else { throw AIError.unparsableNotes }
         var n = MeetingNotes(); n.summary = j["summary"] as? String ?? ""
         n.conclusions = (j["conclusions"] as? [String]) ?? []
         for t in (j["topics"] as? [[String: Any]] ?? []) {
