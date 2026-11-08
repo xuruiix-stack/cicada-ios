@@ -10,6 +10,7 @@ enum AISettings {
     static let chatModelKey = "ai.chatModel"
     static let transcribeModelKey = "ai.transcribeModel"
     static let targetLangKey = "ai.targetLang"
+    static let simultaneousInterpretationKey = "ai.simultaneousInterpretation"
 
     static var baseURL: String {
         get { UserDefaults.standard.string(forKey: baseURLKey) ?? "" }
@@ -26,6 +27,12 @@ enum AISettings {
     static var targetLang: String {
         get { UserDefaults.standard.string(forKey: targetLangKey) ?? "en" }
         set { UserDefaults.standard.set(newValue, forKey: targetLangKey) }
+    }
+    // UserDefaults.bool(forKey:) is false for a missing key, so read the raw
+    // object and default to true — first launch has interpretation on.
+    static var simultaneousInterpretation: Bool {
+        get { UserDefaults.standard.object(forKey: simultaneousInterpretationKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: simultaneousInterpretationKey) }
     }
     static var hasKey: Bool { Keychain.string(for: keyKey) != nil }
     static var isConfigured: Bool { !baseURL.isEmpty && hasKey }
