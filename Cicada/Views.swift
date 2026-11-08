@@ -134,7 +134,7 @@ struct RecordsList: View {
                         }
                     }
                 }
-                .onDelete { model.store.delete($0.first!); model.selection = nil }
+                .onDelete { if let i = $0.first, i < model.store.sessions.count { model.store.delete(model.store.sessions[i]); model.selection = nil } }
             }
         }
         .listStyle(.insetGrouped)
@@ -236,7 +236,7 @@ struct SettingsView: View {
             Section("AI Service (OpenAI-compatible)") {
                 TextField("Base URL", text: $baseURL, prompt: Text("https://api.example.com/v1"))
                     .textInputAutocapitalization(.never).autocorrectionDisabled()
-                    .onChange(of: baseURL) { AISettings.baseURL = baseURL }
+                    .onChange(of: baseURL, perform: { _ in AISettings.baseURL = baseURL })
                 SecureField("API key", text: $keyDraft, prompt: Text("sk-…"))
                     .textInputAutocapitalization(.never).autocorrectionDisabled()
                     .onSubmit(saveKey)
@@ -247,11 +247,11 @@ struct SettingsView: View {
                     Spacer()
                     Button("Check") { Task { _ = await model.ai.checkKey() } }
                 }
-                TextField("Chat model", text: $chatModel).onChange(of: chatModel) { AISettings.chatModel = chatModel }
-                TextField("Transcription model", text: $transcribeModel).onChange(of: transcribeModel) { AISettings.transcribeModel = transcribeModel }
+                TextField("Chat model", text: $chatModel).onChange(of: chatModel, perform: { _ in AISettings.chatModel = chatModel })
+                TextField("Transcription model", text: $transcribeModel).onChange(of: transcribeModel, perform: { _ in AISettings.transcribeModel = transcribeModel })
                 Picker("Translate to", selection: $targetLang) {
                     Text("English").tag("en"); Text("Chinese").tag("zh"); Text("Japanese").tag("ja"); Text("Korean").tag("ko")
-                }.onChange(of: targetLang) { AISettings.targetLang = targetLang }
+                }.onChange(of: targetLang, perform: { _ in AISettings.targetLang = targetLang })
                 if AISettings.hasKey { Button("Remove key", role: .destructive) { Keychain.remove(for: AISettings.keyKey); keyDraft = "" } }
             }
             Section("Privacy") {
