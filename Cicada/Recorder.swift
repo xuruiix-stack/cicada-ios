@@ -21,8 +21,16 @@ final class Recorder: NSObject, ObservableObject {
     private var task: SFSpeechRecognitionTask?
 
     func requestPermissions() async -> Bool {
-        let mic = await AVAudioApplication.requestRecordPermission()
-        let speech = await SFSpeechRecognizer.requestAuthorization()
+        let mic: Bool = await withCheckedContinuation { continuation in
+            AVAudioSession.sharedInstance().requestRecordPermission { granted in
+                continuation.resume(returning: granted)
+            }
+        }
+        let speech: SFSpeechRecognizerAuthorizationStatus = await withCheckedContinuation { continuation in
+            SFSpeechRecognizer.requestAuthorization { status in
+                continuation.resume(returning: status)
+            }
+        }
         return mic && speech == .authorized
     }
 
