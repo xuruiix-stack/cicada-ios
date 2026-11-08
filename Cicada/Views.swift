@@ -62,8 +62,19 @@ final class AppModel: ObservableObject {
         }
         recordingId = nil
         s.endedAt = Date()
+        // Fallback transcript: keep the on-device live captions as one line so
+        // there is text even if server transcription fails. process() replaces it
+        // with the full transcription when that succeeds. Clearing here keeps a
+        // stale caption from leaking into the next session.
+        let live = recorder.liveText; recorder.liveText = ""
+        if !live.isEmpty {
+            s.lines = [TranscriptLine(t: 0, speaker: 1, src: live)]
+        }
         store.save(s)
         selection = s.id
+        // Run the AI pipeline automatically; process() is async and sets `busy`,
+        // so this returns immediately and Stop stays responsive.
+        Task { await process(s) }
     }
 
     /// AI pipeline for a finished recording: transcribe → translate → notes.
@@ -76,6 +87,9 @@ final class AppModel: ObservableObject {
                 let text = try await ai.transcribe(audioURL: url)
                 if !text.isEmpty {
                     s.lines = [TranscriptLine(t: 0, speaker: 1, src: text)]
+                    // Persist the transcript immediately: if translate or notes
+                    // fails below, the transcript is still on the session.
+                    store.save(s)
                 }
             }
             if !s.lines.isEmpty && AISettings.targetLang != "auto" {
