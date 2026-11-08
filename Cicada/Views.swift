@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import Combine
 
 // MARK: - App model wiring record / transcribe / translate / notes
 
@@ -15,19 +16,54 @@ final class AppModel: ObservableObject {
     enum Tab { case records, settings }
 
     var selected: Session? { store.sessions.first { $0.id == selection } }
+    /// The session currently being recorded (kept out of `selection` so the user
+    /// stays where the Stop control is; `selection` is set only when it finishes).
+    @Published var recordingId: String?
+
+    private var subs = Set<AnyCancellable>()
+
+    init() {
+        // store and recorder are nested ObservableObjects; their changes don't fire
+        // AppModel.objectWillChange on their own, so forward them (elapsed, level,
+        // liveText and isRecording would otherwise never re-render).
+        recorder.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &subs)
+        store.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &subs)
+    }
 
     func startRecording() async {
-        guard await recorder.requestPermissions() else { message = "Microphone / speech permission denied."; return }
+        message = nil
+        guard await recorder.requestPermissions() else {
+            message = "Microphone / speech permission denied. Enable the microphone in Settings › Privacy › Microphone."
+            return
+        }
         var s = Session(); s.startedAt = Date()
         let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
             .appendingPathComponent("Cicada/Recordings/\(s.id).m4a")
         s.audioFile = url.lastPathComponent
-        do { try recorder.start(audioURL: url); store.save(s); selection = s.id }
-        catch { message = error.localizedDescription }
+        do {
+            try recorder.start(audioURL: url)
+            store.save(s)
+            recordingId = s.id
+            // No navigation here: the user stays on the list, where Stop and the
+            // live elapsed / level / captions are. The detail page opens on Stop.
+        }
+        catch { message = "Recording could not start: \(error.localizedDescription)" }
     }
     func stopRecording() {
         _ = recorder.stop()
-        if var s = selected { s.endedAt = Date(); store.save(s) }
+        // Look up by recordingId, not `selected`: stopping happens on the list,
+        // where selection is nil and the old lookup silently dropped endedAt.
+        guard let id = recordingId, var s = store.sessions.first(where: { $0.id == id }) else {
+            recordingId = nil; return
+        }
+        recordingId = nil
+        s.endedAt = Date()
+        store.save(s)
+        selection = s.id
     }
 
     /// AI pipeline for a finished recording: transcribe → translate → notes.
@@ -109,8 +145,20 @@ struct RecordsList: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Listen to the room").font(.headline)
-                        Text(model.recorder.isRecording ? "Recording… \(TranscriptExport.clock(model.recorder.elapsed))" : "Record, transcribe, translate and write notes")
-                            .font(.footnote).foregroundStyle(Ink.secondary)
+                        if model.recorder.isRecording {
+                            HStack(spacing: 6) {
+                                Circle().fill(Ink.accent).frame(width: 8, height: 8)
+                                    .opacity(0.4 + 0.6 * Double(model.recorder.level))
+                                Text(TranscriptExport.clock(model.recorder.elapsed)).font(.footnote.monospacedDigit())
+                            }
+                            if !model.recorder.liveText.isEmpty {
+                                Text(model.recorder.liveText).font(.footnote)
+                                    .foregroundStyle(Ink.secondary).lineLimit(2)
+                            }
+                        } else {
+                            Text("Record, transcribe, translate and write notes")
+                                .font(.footnote).foregroundStyle(Ink.secondary)
+                        }
                     }
                     Spacer()
                     if model.recorder.isRecording {
@@ -149,6 +197,11 @@ struct RecordDetail: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
+                // Safety net: if this page is showing while a recording runs (e.g. the
+                // user opened an old session mid-recording), Stop is reachable here.
+                if model.recorder.isRecording {
+                    RecordingBanner()
+                }
                 Text(TranscriptExport.displayTitle(session)).font(.title.bold())
                 Text("\(Int(session.duration/60)) min · \(session.lines.count) lines")
                     .font(.footnote).foregroundStyle(Ink.secondary).padding(.top, 4)
@@ -167,14 +220,42 @@ struct RecordDetail: View {
         .navigationTitle("").navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
+                Button { model.selection = nil } label: {
+                    Image(systemName: "chevron.left")
+                }
                 Button { Task { await model.process(session) } } label: {
                     model.busy ? AnyView(ProgressView()) : AnyView(Image(systemName: "arrow.triangle.2.circlepath"))
-                }.disabled(model.busy)
+                }.disabled(model.busy || model.recorder.isRecording)
                 ShareLink(item: model.exportMarkdown(session), subject: Text(TranscriptExport.displayTitle(session))) {
                     Image(systemName: "square.and.arrow.up")
                 }
             }
         }
+    }
+}
+
+/// Live recording state: elapsed, level, on-device captions, Stop.
+struct RecordingBanner: View {
+    @EnvironmentObject var model: AppModel
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                HStack(spacing: 6) {
+                    Circle().fill(Ink.accent).frame(width: 8, height: 8)
+                        .opacity(0.4 + 0.6 * Double(model.recorder.level))
+                    Text("Recording").font(.footnote.weight(.semibold)).foregroundStyle(Ink.accentText)
+                    Text(TranscriptExport.clock(model.recorder.elapsed)).font(.footnote.monospacedDigit())
+                }
+                Spacer()
+                Button("Stop", role: .destructive) { model.stopRecording() }
+            }
+            if !model.recorder.liveText.isEmpty {
+                Text(model.recorder.liveText).font(.footnote)
+                    .foregroundStyle(Ink.secondary).lineLimit(2)
+            }
+        }
+        .padding(12).background(Ink.accentWash, in: RoundedRectangle(cornerRadius: 12))
+        .padding(.bottom, 12)
     }
 }
 
