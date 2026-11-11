@@ -72,6 +72,12 @@ struct Session: Identifiable, Codable, Equatable {
     var transcribed = false
     /// Persisted reason for the last failed step, shown on the Notes tab.
     var lastError: String?
+    /// Why the on-device live captions never came (model not downloaded, locale
+    /// unsupported…), captured at stop when the fallback transcript is empty
+    /// because of it. Shown on the session's transcript page so "no lines"
+    /// is never mistaken for silence. The pipeline's own errors live in
+    /// `lastError`; this one only ever explains the missing live captions.
+    var liveCaptionNote: String?
     /// Chunks that failed transcription even after their retry (Ling path).
     var failedChunkCount = 0
     var duration: Double { endedAt.map { $0.timeIntervalSince(startedAt) } ?? 0 }
@@ -80,7 +86,7 @@ struct Session: Identifiable, Codable, Equatable {
 extension Session {
     enum CodingKeys: String, CodingKey {
         case id, title, startedAt, endedAt, lines, notes, audioFile
-        case processingState, transcribed, lastError, failedChunkCount
+        case processingState, transcribed, lastError, liveCaptionNote, failedChunkCount
     }
     /// Tolerant decoding: every field falls back to its default, so session
     /// files written before the pipeline-state fields existed keep loading.
@@ -96,6 +102,7 @@ extension Session {
         processingState = try c.decodeIfPresent(ProcessingState.self, forKey: .processingState) ?? .idle
         transcribed = try c.decodeIfPresent(Bool.self, forKey: .transcribed) ?? false
         lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
+        liveCaptionNote = try c.decodeIfPresent(String.self, forKey: .liveCaptionNote)
         failedChunkCount = try c.decodeIfPresent(Int.self, forKey: .failedChunkCount) ?? 0
     }
     func encode(to encoder: Encoder) throws {
@@ -110,6 +117,7 @@ extension Session {
         try c.encode(processingState, forKey: .processingState)
         try c.encode(transcribed, forKey: .transcribed)
         try c.encodeIfPresent(lastError, forKey: .lastError)
+        try c.encodeIfPresent(liveCaptionNote, forKey: .liveCaptionNote)
         try c.encode(failedChunkCount, forKey: .failedChunkCount)
     }
 }
