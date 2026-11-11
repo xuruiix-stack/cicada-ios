@@ -172,8 +172,8 @@ final class Voiceprints: @unchecked Sendable {
 /// else stays unlabelled. Tuned on AMI dev meetings.
 struct VoiceClusterer {
     static let newSeconds = CicadaTuning.newVoiceMinSeconds
-    static let join: Float = CicadaTuning.joinThreshold
-    static let startNew: Float = CicadaTuning.startNewThreshold
+    static let join: Float = Float(CicadaTuning.joinThreshold)
+    static let startNew: Float = Float(CicadaTuning.startNewThreshold)
 
     private(set) var sums: [[Float]] = []
 
