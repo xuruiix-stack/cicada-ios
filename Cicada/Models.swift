@@ -9,6 +9,27 @@ struct TranscriptLine: Identifiable, Codable, Equatable {
     var dst: String?         // translated text
     var srcLang: String = "auto"
     var dstLang: String = "en"
+    /// Which voice the voiceprint engine grouped this line under (SpeakerID.swift).
+    /// Persisted so the speaker numbers survive a relaunch; nil = not identified
+    /// (line too short, model missing, or the voice never reached the shown count).
+    var voice: Int?
+}
+
+extension TranscriptLine {
+    /// Tolerant decoding: `voice` was added after sessions existed without it.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        t = try c.decodeIfPresent(Double.self, forKey: .t) ?? 0
+        speaker = try c.decodeIfPresent(Int.self, forKey: .speaker) ?? 1
+        speakerName = try c.decodeIfPresent(String.self, forKey: .speakerName)
+        src = try c.decodeIfPresent(String.self, forKey: .src) ?? ""
+        dst = try c.decodeIfPresent(String.self, forKey: .dst)
+        srcLang = try c.decodeIfPresent(String.self, forKey: .srcLang) ?? "auto"
+        dstLang = try c.decodeIfPresent(String.self, forKey: .dstLang) ?? "en"
+        voice = try c.decodeIfPresent(Int.self, forKey: .voice)
+    }
+    enum CodingKeys: String, CodingKey { case id, t, speaker, speakerName, src, dst, srcLang, dstLang, voice }
 }
 
 struct ActionItem: Codable, Equatable { var text: String; var owner: String?; var done: Bool = false }
