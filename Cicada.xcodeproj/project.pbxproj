@@ -14,6 +14,10 @@
 		0BEFECCFCABA4BBD8177979F /* Store.swift in Sources */ = {isa = PBXBuildFile; fileRef = 039353809ADA4750AF6D22BE /* Store.swift */; };
 		DB7221ABF07F4C85AB6E1AA6 /* Recorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D8A9F7A29CE46D2BE4B39AA /* Recorder.swift */; };
 		6229341AC58F4754A67ADC15 /* Views.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6A21D8612234FD3B2A4DBFA /* Views.swift */; };
+		7A1C48E29B7D4F0193D2E5C1 /* SpeakerID.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F8B91D0C64A4E27B5E0A9F2 /* SpeakerID.swift */; };
+		8D2E50F1A9C34B68E1D7402F /* RecordRefiner.swift in Sources */ = {isa = PBXBuildFile; fileRef = C074E2B5183D49FA6C8E1D52 /* RecordRefiner.swift */; };
+		9E3F71A0D4C85E29B1F60E73 /* SpeakerEmbedding.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = A5B2D9F0E78C4A13C6F41B85 /* SpeakerEmbedding.mlpackage */; };
+		4D7A91B5E2F84C06A3D85B17 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F1E3A7C09D524B8EA2C64F71 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -25,6 +29,10 @@
 		039353809ADA4750AF6D22BE /* Store.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Store.swift; sourceTree = "<group>"; };
 		8D8A9F7A29CE46D2BE4B39AA /* Recorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Recorder.swift; sourceTree = "<group>"; };
 		D6A21D8612234FD3B2A4DBFA /* Views.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Views.swift; sourceTree = "<group>"; };
+		3F8B91D0C64A4E27B5E0A9F2 /* SpeakerID.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeakerID.swift; sourceTree = "<group>"; };
+		C074E2B5183D49FA6C8E1D52 /* RecordRefiner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordRefiner.swift; sourceTree = "<group>"; };
+		A5B2D9F0E78C4A13C6F41B85 /* SpeakerEmbedding.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder; path = SpeakerEmbedding.mlpackage; sourceTree = "<group>"; };
+		F1E3A7C09D524B8EA2C64F71 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		DE4BFEC7D6174118BB8BE473 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -65,9 +73,21 @@
 				039353809ADA4750AF6D22BE /* Store.swift */,
 				8D8A9F7A29CE46D2BE4B39AA /* Recorder.swift */,
 				D6A21D8612234FD3B2A4DBFA /* Views.swift */,
+				3F8B91D0C64A4E27B5E0A9F2 /* SpeakerID.swift */,
+				C074E2B5183D49FA6C8E1D52 /* RecordRefiner.swift */,
+				F1E3A7C09D524B8EA2C64F71 /* Assets.xcassets */,
 				DE4BFEC7D6174118BB8BE473 /* Info.plist */,
+				2C7F93E4D5A14608B1C4E39F /* Resources */,
 			);
 			path = Cicada;
+			sourceTree = "<group>";
+		};
+		2C7F93E4D5A14608B1C4E39F /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				A5B2D9F0E78C4A13C6F41B85 /* SpeakerEmbedding.mlpackage */,
+			);
+			path = Resources;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -128,6 +148,8 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				9E3F71A0D4C85E29B1F60E73 /* SpeakerEmbedding.mlpackage in Resources */,
+				4D7A91B5E2F84C06A3D85B17 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -145,6 +167,8 @@
 				0BEFECCFCABA4BBD8177979F /* Store.swift in Sources */,
 				DB7221ABF07F4C85AB6E1AA6 /* Recorder.swift in Sources */,
 				6229341AC58F4754A67ADC15 /* Views.swift in Sources */,
+				7A1C48E29B7D4F0193D2E5C1 /* SpeakerID.swift in Sources */,
+				8D2E50F1A9C34B68E1D7402F /* RecordRefiner.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
