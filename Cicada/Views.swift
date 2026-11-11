@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import Combine
+import Network
 import UIKit
 
 // MARK: - App model wiring record / transcribe / translate / notes
@@ -54,6 +55,26 @@ final class AppModel: ObservableObject {
     /// work from then on (graceful degradation — every line keeps speaker 1).
     private var voiceprintsUnavailable = false
 
+    // Offline usability (2026-11-11 user report: recorded with no signal, got
+    // nothing). Cloud transcription needs the network; when it fails, the
+    // session sits with transcribed == false until someone taps ↻. Watch the
+    // network and, when it comes back, re-run the pipeline on the sessions
+    // the recording of which predates this connectivity event.
+    private var pathMonitor: NWPathMonitor?
+    private var monitorQueue = DispatchQueue(label: "cicada.netmonitor")
+    /// Current connectivity, from the NWPathMonitor. The detail page uses it to
+    /// say WHY a stopped session has no transcript (offline) and that the
+    /// transcript will be filled in automatically on reconnect.
+    @Published private(set) var networkAvailable = true
+    /// Set once the monitor delivers its first verdict, so the initial
+    /// callback (always sent at startup, whatever the state) is not mistaken
+    /// for a recovery and triggers a pointless retry pass.
+    private var sawFirstPath = false
+    /// Sessions already retried for the current connectivity window. Cleared
+    /// when the network drops again, so the NEXT recovery retries them once
+    /// more — but within one window each session gets exactly one shot.
+    private var autoRetriedIds: Set<String> = []
+
     init() {
         // store and recorder are nested ObservableObjects; their changes don't fire
         // AppModel.objectWillChange on their own, so forward them (elapsed, level,
@@ -80,6 +101,70 @@ final class AppModel: ObservableObject {
             store.sessions[i].processingState = .failed
             store.sessions[i].lastError = "Processing was interrupted before it finished."
             store.save(store.sessions[i])
+        }
+        startNetworkMonitor()
+    }
+
+    // MARK: - Network recovery: auto-retry cloud transcription when signal returns
+
+    /// Foreground-only NWPathMonitor (no background audio / voip entitlements
+    /// touched: the app is not allowed to run for network changes in the
+    /// background, and we don't need it to — the retry can wait until the user
+    /// opens the app, which is when this monitor is live again). The first
+    /// callback is the current state, not a transition: it only records the
+    /// baseline. Only an unsatisfied → satisfied transition triggers retries.
+    private func startNetworkMonitor() {
+        let m = NWPathMonitor()
+        m.pathUpdateHandler = { [weak self] path in
+            DispatchQueue.main.async { self?.pathChanged(path) }
+        }
+        m.start(queue: monitorQueue)
+        pathMonitor = m
+    }
+
+    private func pathChanged(_ path: NWPath) {
+        let now = path.status == .satisfied
+        let first = !sawFirstPath
+        let wasAvailable = networkAvailable
+        sawFirstPath = true
+        networkAvailable = now
+        if first || now == wasAvailable { return }   // baseline or no transition
+        if !now {
+            autoRetriedIds = []   // a new offline window opens a new retry budget
+            return
+        }
+        retryUntranscribedAfterReconnect()
+    }
+
+    /// Network just came back: re-run process() on every stopped session that
+    /// has audio but no server transcription. runPipeline's `if !s.transcribed`
+    /// skip keeps already-succeeded steps from re-running, so this only costs
+    /// the transcription that never happened. One retry per session per
+    /// connectivity window (autoRetriedIds, cleared on the next drop): a
+    /// server that is still unreachable fails into lastError as before, and
+    /// the next offline→online cycle takes another single shot at it.
+    private func retryUntranscribedAfterReconnect() {
+        // Never while a recording is in flight: the pipeline would race the
+        // recorder and the about-to-start processing of the live session.
+        guard recordingId == nil, !recorder.isRecording else { return }
+        // If a pipeline is already running, the user beat us to ↻ — don't
+        // queue a second one behind it (process() would drop it anyway).
+        guard !pipelineActive else { return }
+        guard AISettings.isConfigured else { return }
+        // Mark them all up front: a later re-entrant call (the monitor can
+        // fire more than once per window) must not double-book a session.
+        let todo = store.sessions.filter {
+            $0.endedAt != nil && $0.audioFile != nil && !$0.transcribed && !autoRetriedIds.contains($0.id)
+        }
+        guard !todo.isEmpty else { return }
+        autoRetriedIds.formUnion(todo.map(\.id))
+        // Sequentially: process() serializes via pipelineActive and drops
+        // concurrent runs, so one Task per session would drop all but the
+        // first. One Task awaiting them in order runs each to completion.
+        Task { [weak self] in
+            for s in todo {
+                await self?.process(s)
+            }
         }
     }
 
@@ -152,6 +237,11 @@ final class AppModel: ObservableObject {
         if !live.isEmpty {
             s.lines = [TranscriptLine(t: 0, speaker: 1, src: live)]
         }
+        // Same for the caption failure reason: with it on the session, the
+        // transcript page can say why there are no lines at all (offline
+        // model not downloaded) instead of showing bare "No transcript yet."
+        s.liveCaptionNote = recorder.recognitionError
+        recorder.recognitionError = nil
         store.save(s)
         selection = s.id
         // Speaker separation first, then the pipeline: applySpeakers groups the voices
@@ -459,6 +549,10 @@ struct RecordsList: View {
                                 Text(model.recorder.liveText).font(.footnote)
                                     .foregroundStyle(Ink.secondary).lineLimit(2)
                             }
+                            if let re = model.recorder.recognitionError {
+                                Text(re).font(.footnote)
+                                    .foregroundStyle(Ink.secondary).lineLimit(4)
+                            }
                         } else {
                             Text("Record, transcribe, translate and write notes")
                                 .font(.footnote).foregroundStyle(Ink.secondary)
@@ -514,7 +608,23 @@ struct RecordDetail: View {
                 }.pickerStyle(.segmented).padding(.top, 16)
                 if page == 0 {
                     ForEach(session.lines) { l in TranscriptRow(line: l) }
-                    if session.lines.isEmpty { Text("No transcript yet.").foregroundStyle(Ink.secondary).padding(.top, 24) }
+                    if session.lines.isEmpty {
+                        Text("No transcript yet.").foregroundStyle(Ink.secondary).padding(.top, 24)
+                        // The offline case, said plainly: the recording exists and
+                        // is safe, the cloud transcription needs the network, and
+                        // it will be retried automatically when signal returns.
+                        if !session.transcribed, session.audioFile != nil, !model.networkAvailable {
+                            Text("You appear to be offline — the audio is saved, and the transcript will be generated automatically once the network is back.")
+                                .font(.footnote).foregroundStyle(Ink.secondary).padding(.top, 6)
+                        }
+                        // Why the live captions (and thus the fallback line)
+                        // never came — e.g. the on-device model for this
+                        // language was never downloaded. Persisted with the
+                        // session at stop, so it survives relaunch.
+                        if let note = session.liveCaptionNote {
+                            Text(note).font(.footnote).foregroundStyle(Ink.secondary).padding(.top, 6)
+                        }
+                    }
                 } else {
                     NotesView(notes: session.notes, state: session.processingState,
                               lastError: session.lastError, failedChunks: session.failedChunkCount)
@@ -557,6 +667,10 @@ struct RecordingBanner: View {
             if !model.recorder.liveText.isEmpty {
                 Text(model.recorder.liveText).font(.footnote)
                     .foregroundStyle(Ink.secondary).lineLimit(2)
+            }
+            if let re = model.recorder.recognitionError {
+                Text(re).font(.footnote)
+                    .foregroundStyle(Ink.secondary).lineLimit(4)
             }
         }
         .padding(12).background(Ink.accentWash, in: RoundedRectangle(cornerRadius: 12))
