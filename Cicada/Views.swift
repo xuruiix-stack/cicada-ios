@@ -33,6 +33,26 @@ final class AppModel: ObservableObject {
     private var pipelineActive = false
 
     private var subs = Set<AnyCancellable>()
+    /// Speaker separation: the voiceprint engine (SpeakerID.swift). Segments' audio is
+    /// embedded as they close during the recording; the grouping happens at stop, in
+    /// segment order.
+    private let speakers = SpeakerTagger()
+    /// Voice segments closed so far in the current recording: id, start time, the audio's
+    /// length in frames (for the clusterer's seconds), the voiceprint (nil until it comes
+    /// back — `unsettled` still true means it is on the work queue), and the caption words
+    /// said in it.
+    private struct PendingSeg {
+        let id: String
+        let t: Double
+        let samplesFrames: Int
+        var emb: [Float]?
+        var unsettled = true
+        var caption = ""
+    }
+    private var pendingSegs: [PendingSeg] = []
+    /// `true` while the model is known missing/unloadable: skip the per-segment embedding
+    /// work from then on (graceful degradation — every line keeps speaker 1).
+    private var voiceprintsUnavailable = false
 
     init() {
         // store and recorder are nested ObservableObjects; their changes don't fire
@@ -44,6 +64,14 @@ final class AppModel: ObservableObject {
         store.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &subs)
+        // Speaker separation: the recorder's voice gate closes segments while the
+        // recording runs; embed each one's audio as it arrives (voiceSegmentArrived),
+        // so stop-time work is only the grouping. objectWillChange fires before the
+        // change lands, so read the segments on the next run-loop turn.
+        recorder.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.drainVoiceSegments() }
+            .store(in: &subs)
         // A session persisted as .running means the app was killed mid-pipeline
         // (background time ran out or iOS terminated us): no Task is working on
         // it anymore. Mark it failed so the Notes tab shows the reason instead
@@ -52,6 +80,35 @@ final class AppModel: ObservableObject {
             store.sessions[i].processingState = .failed
             store.sessions[i].lastError = "Processing was interrupted before it finished."
             store.save(store.sessions[i])
+        }
+    }
+
+    /// Segments the gate closed since the last drain: embed each one's audio off the
+    /// main thread right away — a long meeting would otherwise hold every segment's
+    /// raw audio in memory until stop (20 s of 16 kHz mono is 1.2 MB; an embedding
+    /// is 1 KB). Runs during the recording via the recorder's change stream, and
+    /// once more from applySpeakers after stop (the guard lets that last drain in).
+    private func drainVoiceSegments() {
+        guard recordingId != nil || !recorder.voiceSegments.isEmpty else { return }
+        for seg in recorder.takeVoiceSegments() { voiceSegmentArrived(seg) }
+    }
+
+    private func voiceSegmentArrived(_ seg: VoiceSegment) {
+        let id = UUID().uuidString
+        var p = PendingSeg(id: id, t: seg.t, samplesFrames: seg.samples.count)
+        guard !voiceprintsUnavailable else {
+            p.unsettled = false   // no model: nothing is coming, don't wait for it
+            pendingSegs.append(p)
+            return
+        }
+        pendingSegs.append(p)
+        speakers.embed(seg.samples) { [weak self] emb in
+            guard let self else { return }
+            if !self.speakers.available { self.voiceprintsUnavailable = true }
+            if let i = self.pendingSegs.firstIndex(where: { $0.id == id }) {
+                self.pendingSegs[i].emb = emb
+                self.pendingSegs[i].unsettled = false
+            }
         }
     }
 
@@ -69,6 +126,10 @@ final class AppModel: ObservableObject {
             try recorder.start(audioURL: url)
             store.save(s)
             recordingId = s.id
+            // Speaker separation: a fresh recording starts with fresh voices.
+            speakers.reset()
+            pendingSegs = []
+            voiceprintsUnavailable = false
             // No navigation here: the user stays on the list, where Stop and the
             // live elapsed / level / captions are. The detail page opens on Stop.
         }
@@ -93,12 +154,108 @@ final class AppModel: ObservableObject {
         }
         store.save(s)
         selection = s.id
-        // Run the AI pipeline automatically; process() is async and sets `busy`,
-        // so this returns immediately and Stop stays responsive. process() wraps
-        // the work in a UIApplication background task: if the user locks the
-        // screen or switches away right after stopping, iOS grants a few extra
-        // seconds instead of suspending the app mid-pipeline.
-        Task { await process(s) }
+        // Speaker separation first, then the pipeline: applySpeakers groups the voices
+        // heard in this recording and lays the transcript over the segments, and the
+        // pipeline's server transcription must not race it. process() is async and
+        // sets `busy`, so this returns immediately and Stop stays responsive. Both run
+        // under the same Task so their saves stay ordered.
+        Task {
+            await self.applySpeakers(s)
+            await self.process(s)
+        }
+    }
+
+    /// Speaker separation at stop: cluster the segments' voiceprints in recording order
+    /// (online clustering — a line already labelled is never revisited), then rebuild the
+    /// session's lines so each carries its voice's speaker number and the transcript text
+    /// said in its segment (RecordRefiner's alignment). With no voices on show (a solo
+    /// recording, or the model unavailable) the fallback line below stays as it was.
+    ///
+    /// The transcript at this point is the live captions fallback (one line); the server
+    /// transcript comes later in process(). The alignment therefore runs here against the
+    /// captions, and again in the pipeline once the server text arrives (refineTranscript).
+    private func applySpeakers(_ s: Session) async {
+        // Anything the gate closed between the last drain and the flush at stop.
+        drainVoiceSegments()
+        guard !pendingSegs.isEmpty else { return }
+        // Wait for the embeddings still in flight. `settled` marks a segment whose embed
+        // came back (nil = too short, a breath or a click, not a voiceprint — it stays
+        // unlabelled, as upstream); an unsettled one is still on the work queue.
+        while pendingSegs.contains(where: { $0.emb == nil && $0.unsettled }) {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        // Caption each segment with the on-device words said in it.
+        let timed = recorder.timedWords
+        var captioned = pendingSegs
+        for i in captioned.indices {
+            let t0 = captioned[i].t
+            let t1 = i + 1 < captioned.count ? captioned[i + 1].t : .infinity
+            captioned[i].caption = timed.filter { $0.mid >= t0 && $0.mid < t1 }
+                .map(\.text).joined(separator: " ")
+        }
+        let segs = captioned
+        pendingSegs = []
+        guard var session = store.sessions.first(where: { $0.id == s.id }) else { return }
+        // Group the voices in order (online clustering, upstream's rule). `label`'s
+        // seconds are the segment's speaking time, not the embedding's length.
+        var clusterer = VoiceClusterer()
+        var voices: [Int?] = []
+        for seg in segs {
+            let seconds = Double(seg.samplesFrames) / CicadaTuning.sampleRate
+            voices.append(seg.emb.flatMap { clusterer.label($0, seconds: seconds) })
+        }
+        // Lines: one per segment. A segment with no voice of its own (too short to
+        // embed, or unlike every known voice) keeps voice nil — upstream ab787d4's
+        // rule: a short reply in a voice not yet known does not join the answer
+        // before it, so it never takes its neighbour's voice either.
+        var lines: [TranscriptLine] = []
+        for (i, seg) in segs.enumerated() {
+            var l = TranscriptLine(t: seg.t, speaker: 1, src: seg.caption)
+            l.voice = voices[i]
+            lines.append(l)
+        }
+        // Speaker numbers: only shown voices get one; the rest keep 1 (S1).
+        let numbers = SpeakerLabels.voiceNumbers(lines)
+        for i in lines.indices {
+            if let v = lines[i].voice, let n = numbers[v] { lines[i].speaker = n }
+        }
+        // No voice was identified anywhere (the model never loaded, or a recording
+        // of silence): leave the liveText fallback line as the transcript instead
+        // of replacing it with caption fragments no voice was told apart in.
+        guard lines.contains(where: { $0.voice != nil }) else { return }
+        session.lines = lines
+        store.save(session)
+    }
+
+    /// The server transcript laid over the segment lines: each line keeps its time and
+    /// voice and gets the words said in it (RecordRefiner's edit-distance alignment,
+    /// bounded window per segment). Lines whose caption text was too short to align get
+    /// their proportional share of the transcript by speaking time.
+    private func refineTranscript(_ text: String, onto lines: [TranscriptLine]) -> [TranscriptLine] {
+        let record = Array(text)
+        guard !record.isEmpty, !lines.isEmpty else { return lines }
+        // Each line's provisional range: its start's share of the transcript, plus
+        // one segment's worth (8 s). The alignment moves the boundaries; this only
+        // bounds its windows and backs up the lines with no caption text.
+        let total = max(lines.last?.t ?? 0, 1)
+        var segs: [RecordRefiner.Segment] = []
+        for l in lines {
+            let a = Int(Double(record.count) * max(0, l.t) / total)
+            let b = min(record.count, Int(Double(record.count) * min(1, (l.t + 8) / total)))
+            segs.append(RecordRefiner.Segment(text: l.src, provisional: a..<max(a, b)))
+        }
+        let ends = RecordRefiner.ends(segments: segs, record: record)
+        var out = lines
+        var from = 0
+        for i in out.indices {
+            let to = i == out.count - 1 ? record.count : (i < ends.count ? ends[i] : record.count)
+            out[i].src = String(record[from..<max(from, to)]).trimmingCharacters(in: .whitespacesAndNewlines)
+            from = max(from, to)
+        }
+        // A line the alignment left with no text (all its words went to a neighbour)
+        // keeps its caption rather than showing empty.
+        for i in out.indices where out[i].src.isEmpty { out[i].src = lines[i].src }
+        return out
     }
 
     /// AI pipeline for a finished recording: transcribe → translate → notes.
@@ -168,7 +325,17 @@ final class AppModel: ObservableObject {
                     text = try await ai.transcribe(audioURL: url)
                 }
                 if !text.isEmpty {
-                    s.lines = [TranscriptLine(t: 0, speaker: 1, src: text)]
+                    // Speaker separation: when the recording's segments were laid out
+                    // as lines (applySpeakers — every line has a voice or a caption),
+                    // the server transcript takes each line's place, aligned by its
+                    // caption text (RecordRefiner, upstream 4cb8512's boundary fix
+                    // included). Without segments (the model unavailable, or a
+                    // recording with no voiced audio) the whole transcript stays one
+                    // line, as before. The liveText fallback line never has a voice,
+                    // so it takes the one-line path.
+                    let segmented = s.lines.count > 1 && s.lines.allSatisfy { $0.voice != nil || !$0.src.isEmpty }
+                    s.lines = segmented ? refineTranscript(text, onto: s.lines)
+                        : [TranscriptLine(t: 0, speaker: 1, src: text)]
                     s.transcribed = true
                     s.failedChunkCount = failedChunks
                     // Persist the transcript immediately: if translate or notes
