@@ -21,6 +21,10 @@ final class Recorder: NSObject, ObservableObject {
     @Published var elapsed: Double = 0
     @Published var liveText = ""
     @Published var error: String?
+    /// Why on-device recognition isn't producing live captions (model not
+    /// downloaded, locale unsupported, recognizer failed…). The recording
+    /// page shows it so a silent failure is never mistaken for silence.
+    @Published var recognitionError: String?
 
     /// Segments closed since the last read (speaker separation). Published on the main
     /// thread; the tap hands them over there. The consumer (AppModel) reads and clears.
@@ -108,26 +112,78 @@ final class Recorder: NSObject, ObservableObject {
             self.elapsed = Date().timeIntervalSince(self.startedAt) }
         timer = t
         RunLoop.main.add(t, forMode: .common)
-        // Live on-device captions
+        // Live on-device captions. requiresOnDeviceRecognition stays true —
+        // offline subtitles are the point — but the model for this locale may
+        // never have been downloaded, in which case the task fails outright.
+        // That used to be swallowed by the result guard and looked like "no
+        // captions": surface it instead (recognitionError, shown on the
+        // recording page).
+        recognitionError = nil
         if let rec = SFSpeechRecognizer(locale: Locale(identifier: locale)) {
             recognizer = rec
+            if !rec.supportsOnDeviceRecognition {
+                recognitionError = "On-device speech recognition is not available for this language on this device, so there are no offline live captions. The recording itself is unaffected; the transcript will be generated when online."
+            }
             let req = SFSpeechAudioBufferRecognitionRequest()
             req.shouldReportPartialResults = true; req.requiresOnDeviceRecognition = true
             request = req
-            task = rec.recognitionTask(with: req) { [weak self] result, _ in
-                guard let r = result else { return }
-                DispatchQueue.main.async {
-                    self?.liveText = r.bestTranscription.formattedString
-                    // Word timestamps for the segment captions (speaker separation):
-                    // SFTranscription's timestamps run on the recognizer's own clock,
-                    // which starts when the request was made — the same moment as
-                    // `startedAt`, so they read as recording time directly.
-                    self?.timedWords = r.bestTranscription.segments.map {
-                        (mid: $0.timestamp + $0.duration / 2, text: String($0.substring))
+            task = rec.recognitionTask(with: req) { [weak self] result, err in
+                if let r = result {
+                    DispatchQueue.main.async {
+                        self?.liveText = r.bestTranscription.formattedString
+                        // Word timestamps for the segment captions (speaker separation):
+                        // SFTranscription's timestamps run on the recognizer's own clock,
+                        // which starts when the request was made — the same moment as
+                        // `startedAt`, so they read as recording time directly.
+                        self?.timedWords = r.bestTranscription.segments.map {
+                            (mid: $0.timestamp + $0.duration / 2, text: String($0.substring))
+                        }
+                    }
+                }
+                // A recognition error is not the recording's end: audio keeps
+                // going to the file. Say WHY the captions stopped, in plain words.
+                // Cancellation is not an error here: stop() cancels the task,
+                // and the cancel callback must not paint a failure note over a
+                // recording whose captions worked fine (SFSpeechRecognizer
+                // delivers an error on cancel; code 216 in its own domain).
+                if let e = err, !Self.isCancellation(e) {
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        guard self.recognitionError == nil else { return }
+                        // With requiresOnDeviceRecognition, an error before any
+                        // result at all is, in practice, the on-device model for
+                        // this locale never having been downloaded (the exact
+                        // kAFAssistantErrorDomain code varies by OS). After some
+                        // results, it's a mid-run failure — keep the system's
+                        // wording for that one.
+                        self.recognitionError = self.liveText.isEmpty
+                            ? "The on-device speech model for this language is not downloaded, so there are no offline live captions. Connect to the internet once so iOS can download it — after that, live captions work offline too. The recording itself is unaffected; the transcript will be generated when online."
+                            : Self.describeRecognitionError(e)
                     }
                 }
             }
+        } else {
+            recognitionError = "No speech recognizer exists for this language, so there are no offline live captions. The recording itself is unaffected; the transcript will be generated when online."
         }
+    }
+
+    /// Turn a mid-run SFSpeechRecognizer error into something a person can
+    /// act on. The never-started case (model missing) is handled at the call
+    /// site; this covers captions that worked and then stopped.
+    static func describeRecognitionError(_ e: Error) -> String {
+        let ns = e as NSError
+        return "Live captions stopped: \(ns.localizedDescription) The recording itself is unaffected; the transcript will be generated when online."
+    }
+
+    /// Recognition-task cancellation (stop()): delivered to the callback as an
+    /// error, but not a failure. Identified by the cancel code in the
+    /// recognizer's own domain, or by the Cocoa cancellation code / Swift's
+    /// CancellationError as fallbacks.
+    static func isCancellation(_ e: Error) -> Bool {
+        let ns = e as NSError
+        if ns.domain == "SFSpeechRecognizerErrorDomain", ns.code == 216 { return true }
+        if ns.domain == NSCocoaErrorDomain, ns.code == NSUserCancelledError { return true }
+        return (e as? CancellationError) != nil
     }
 
     /// Segments closed so far, taken and cleared (AppModel reads on each arrive).
@@ -217,6 +273,8 @@ final class Recorder: NSObject, ObservableObject {
         timer?.invalidate(); timer = nil
         engine?.inputNode.removeTap(onBus: 0); engine?.stop(); engine = nil; converter = nil
         request?.endAudio(); task?.cancel(); request = nil; task = nil; recognizer = nil
+        // recognitionError stays readable until stopRecording() (AppModel)
+        // moves it onto the session as liveCaptionNote; start() clears it.
         // A voice still open when Stop was tapped is a segment too (its pause never came).
         // The tap is gone (removeTap above), so the gate state is all ours now, but take
         // the lock anyway: a tap callback already past removeTap may still be finishing.
