@@ -85,9 +85,17 @@
 		2C7F93E4D5A14608B1C4E39F /* Resources */ = {
 			isa = PBXGroup;
 			children = (
-				A5B2D9F0E78C4A13C6F41B85 /* SpeakerEmbedding.mlpackage */,
+				523EA35F6A104CED97F957F4 /* models */,
 			);
 			path = Resources;
+			sourceTree = "<group>";
+		};
+		523EA35F6A104CED97F957F4 /* models */ = {
+			isa = PBXGroup;
+			children = (
+				A5B2D9F0E78C4A13C6F41B85 /* SpeakerEmbedding.mlpackage */,
+			);
+			path = models;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
