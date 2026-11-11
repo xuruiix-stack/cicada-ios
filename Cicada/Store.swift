@@ -81,18 +81,8 @@ final class SessionStore: ObservableObject {
     }
     func audioURL(for s: Session) -> URL? { s.audioFile.map { audioDir.appendingPathComponent($0) } }
 
-    /// Speaker separation: assign 1-based numbers in first-appearance order; a voice needs
-    /// ≥3 words (or ≥4 CJK chars) on ≥5 lines before its number is shown (original rule).
-    static func speakerNumbers(_ lines: [TranscriptLine]) -> [Int: Int] {
-        var counts: [Int: Int] = [:]; var reached: [Int: Int] = [:]; var order: [Int] = []
-        for (i, l) in lines.enumerated() {
-            if !substantive(l.src) { continue }
-            counts[l.speaker, default: 0] += 1
-            if counts[l.speaker] == CicadaTuning.shownAfter { reached[l.speaker] = i; order.append(l.speaker) }
-        }
-        if order.count < 2 { return [:] }
-        return Dictionary(uniqueKeysWithValues: order.sorted { reached[$0]! < reached[$1]! }.enumerated().map { ($1, $0 + 1) })
-    }
+    /// Speaker separation (SpeakerID.swift): a line counts towards its voice's number only
+    /// when substantive. Original rule (speakers.py substantive/_cjk): >=3 words, or >=4 CJK chars.
     static func substantive(_ text: String) -> Bool {
         // Original rule (speakers.py substantive/_cjk): >=3 words, or >=4 CJK chars.
         let words = text.split(whereSeparator: { $0.isWhitespace })
