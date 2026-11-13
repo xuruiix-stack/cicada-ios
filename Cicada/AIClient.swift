@@ -70,27 +70,63 @@ enum Keychain {
 }
 
 enum AIError: LocalizedError {
-    case notConfigured, invalidResponse, unparsableNotes, http(Int, String?), underlying(Error)
+    case notConfigured
+    /// nil host = not a service reply at all (the local .m4a→wav conversion
+    /// could not read the recording's format); otherwise the host that
+    /// answered with something unusable.
+    case invalidResponse(host: String?)
+    case unparsableNotes(host: String)
+    case http(Int, String?, host: String)
+    case unreachable(host: String, Error)
+    case underlying(Error)
     var errorDescription: String? {
         switch self {
         case .notConfigured: return "Set the API base URL and key in Settings › AI Service."
-        case .invalidResponse: return "The service returned an unexpected response."
+        case .invalidResponse(let host):
+            // Name the service that misbehaved (upstream v1.9.0's rule); nil host
+            // is a local audio problem, not the service's.
+            if let host { return "\(host) returned an unexpected response." }
+            return "The service returned an unexpected response."
         // Notes step: the chat replied, but not with usable JSON — say so
         // instead of silently rendering empty notes.
-        case .unparsableNotes: return "The model's notes reply was not valid JSON."
+        case .unparsableNotes(let host): return "\(host)'s notes reply was not valid JSON."
         // Show the server's own reason (Ling/OpenRouter reject wrong models, formats
         // and over-long audio with 400 + message) instead of a bare status code.
-        case .http(let c, let detail):
-            if let d = detail, !d.isEmpty { return "Service error (HTTP \(c)): \(d)" }
-            return "Service error (HTTP \(c))."
+        // The host is the one actually called (upstream v1.9.0's rule): with several
+        // OpenAI-compatible services around, "HTTP 401" alone says nothing about
+        // WHICH key to fix, and 401/403 mean the key was refused — say that, not
+        // a bare code.
+        case .http(let c, let detail, let host):
+            if c == 401 || c == 403 {
+                if let d = detail, !d.isEmpty { return "\(host) rejected the API key (HTTP \(c)): \(d)" }
+                return "\(host) rejected the API key (HTTP \(c))."
+            }
+            if let d = detail, !d.isEmpty { return "\(host) error (HTTP \(c)): \(d)" }
+            return "\(host) error (HTTP \(c))."
+        // The request never came back (offline, DNS, refused connection): name the
+        // host so the message matches the HTTP errors' wording.
+        case .unreachable(let host, let e): return "Could not reach \(host): \(e.localizedDescription)"
         case .underlying(let e): return e.localizedDescription
         }
     }
 }
 
+/// What the Settings "Check" found (review-2 P1-2): the result was previously
+/// never rendered — the status UI read mere key existence, so a refused key and
+/// a working one looked identical. Upstream's AICheck is a step machine; this
+/// app's check is a single chat ping, so one state with a reason is enough.
+enum AIStatus: Equatable {
+    case idle              // no check has run yet
+    case checking
+    case ok
+    case failed(String)    // the error's localizedDescription
+}
+
 /// OpenAI-compatible client: POST {base}/chat/completions and {base}/audio/transcriptions.
 final class AIClient: ObservableObject {
-    @Published var status: String = AISettings.isConfigured ? "Connected" : "Not set up"
+    /// The Settings AI section renders this (checking spinner / OK / failure
+    /// reason). Replaces the old String status, which no view ever read.
+    @Published var status: AIStatus = .idle
 
     private func endpoint(_ path: String) throws -> URL {
         guard AISettings.isConfigured, let key = Keychain.string(for: AISettings.keyKey) else { throw AIError.notConfigured }
@@ -123,9 +159,9 @@ final class AIClient: ObservableObject {
         return s.isEmpty ? nil : String(s.prefix(500))
     }
 
-    private func throwHTTP(_ resp: URLResponse, body data: Data) -> AIError {
+    private func throwHTTP(_ resp: URLResponse, body data: Data, host: String) -> AIError {
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        return .http(code, bodyDetail(data))
+        return .http(code, bodyDetail(data), host: host)
     }
 
     func chat(system: String, user: String, json: Bool = false) async throws -> String {
@@ -142,13 +178,16 @@ final class AIClient: ObservableObject {
             "messages": [["role": "system", "content": system], ["role": "user", "content": user]],
             "temperature": 0.3, "max_tokens": CicadaTuning.notesMaxTokens]
         r.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, resp) = try await URLSession.shared.data(for: r)
+        let (data, resp): (Data, URLResponse)
+        do { (data, resp) = try await URLSession.shared.data(for: r) }
+        catch { throw AIError.unreachable(host: url.host ?? url.absoluteString, error) }
         guard let h = resp as? HTTPURLResponse, h.statusCode == 200 else {
-            throw throwHTTP(resp, body: data) }
+            throw throwHTTP(resp, body: data, host: url.host ?? "") }
         guard let j = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let choices = j["choices"] as? [[String: Any]],
               let msg = choices.first?["message"] as? [String: Any],
-              let content = msg["content"] as? String else { throw AIError.invalidResponse }
+              let content = msg["content"] as? String else {
+            throw AIError.invalidResponse(host: url.host) }
         _ = json; return content
     }
 
@@ -244,11 +283,14 @@ final class AIClient: ObservableObject {
         body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"\(fileURL.lastPathComponent)\"\r\nContent-Type: \(mime)\r\n\r\n".data(using: .utf8)!)
         body.append(file); body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
         r.httpBody = body
-        let (data, resp) = try await URLSession.shared.data(for: r)
+        let (data, resp): (Data, URLResponse)
+        do { (data, resp) = try await URLSession.shared.data(for: r) }
+        catch { throw AIError.unreachable(host: url.host ?? url.absoluteString, error) }
         guard let h = resp as? HTTPURLResponse, h.statusCode == 200 else {
-            throw throwHTTP(resp, body: data) }
+            throw throwHTTP(resp, body: data, host: url.host ?? "") }
         guard let j = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let text = j["text"] as? String else { throw AIError.invalidResponse }
+              let text = j["text"] as? String else {
+            throw AIError.invalidResponse(host: url.host) }
         return text
     }
 
@@ -259,7 +301,9 @@ final class AIClient: ObservableObject {
         let src = try AVAudioFile(forReading: audioURL)
         guard let out = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                       sampleRate: CicadaTuning.sampleRate, channels: 1, interleaved: false),
-              src.processingFormat.sampleRate > 0 else { throw AIError.invalidResponse }
+              src.processingFormat.sampleRate > 0 else {
+            // Local audio problem, not a service reply: no host to name.
+            throw AIError.invalidResponse(host: nil) }
         let conv = src.processingFormat == out ? nil
             : AVAudioConverter(from: src.processingFormat, to: out)
         let dir = FileManager.default.temporaryDirectory
@@ -461,7 +505,8 @@ final class AIClient: ObservableObject {
         let raw = try await chat(
             system: "You write structured meeting notes. Reply with JSON only: {\"summary\":string,\"topics\":[{\"title\":string,\"points\":[string]}],\"conclusions\":[string],\"actionItems\":[{\"text\":string,\"owner\":string|null}]}",
             user: transcript, json: true)
-        guard let j = extractNotesJSON(from: raw) else { throw AIError.unparsableNotes }
+        guard let j = extractNotesJSON(from: raw) else {
+            throw AIError.unparsableNotes(host: baseURLHost) }
         var n = MeetingNotes(); n.summary = j["summary"] as? String ?? ""
         n.conclusions = (j["conclusions"] as? [String]) ?? []
         for t in (j["topics"] as? [[String: Any]] ?? []) {
@@ -471,8 +516,13 @@ final class AIClient: ObservableObject {
         return n
     }
 
+    /// Settings › Check: one chat ping proves the address, the key and the chat
+    /// model at once. The result goes to `status` for the settings row to render
+    /// (checking / OK / failed with the reason — errors name the host, so a
+    /// refused key says which service refused it).
     func checkKey() async -> Bool {
-        do { _ = try await chat(system: "Reply OK", user: "ping"); status = "Connected"; return true }
-        catch { status = "Check failed"; return false }
+        status = .checking
+        do { _ = try await chat(system: "Reply OK", user: "ping"); status = .ok; return true }
+        catch { status = .failed(error.localizedDescription); return false }
     }
 }
