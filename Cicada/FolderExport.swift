@@ -187,9 +187,10 @@ final class FolderExporter: ObservableObject {
         let gotAccess = scoped.startAccessingSecurityScopedResource()
         defer { if gotAccess { scoped.stopAccessingSecurityScopedResource() } }
         do {
-            // .withSecurityScope is the iOS-persistent form (plain bookmarks
+            // iOS bookmarks are inherently security-scoped: creation takes no
+            // options (.withSecurityScope is macOS-only and does not compile here).
             // lose the user's grant across launches).
-            let data = try scoped.bookmarkData(options: .withSecurityScope)
+            let data = try scoped.bookmarkData(options: [])
             FolderSettings.bookmark = data
             FolderSettings.folderPath = url.path
             FolderSettings.resetFiles()
@@ -234,7 +235,7 @@ final class FolderExporter: ObservableObject {
         var stale = false
         let resolved: URL?
         do {
-            resolved = try URL(resolvingBookmarkData: data, options: .withSecurityScope,
+            resolved = try URL(resolvingBookmarkData: data, options: [],
                                relativeTo: nil, bookmarkDataIsStale: &stale)
         } catch {
             debugLog("folder export: bookmark unresolvable: \(error.localizedDescription)")
@@ -250,7 +251,7 @@ final class FolderExporter: ObservableObject {
             // iOS says the bookmark still resolves but was rebuilt (the user
             // re-created the folder, or the file provider remounted): refresh
             // the stored bookmark so the next write resolves cleanly.
-            if let fresh = try? url.bookmarkData(options: .withSecurityScope) {
+            if let fresh = try? url.bookmarkData(options: []) {
                 FolderSettings.bookmark = fresh
             }
         }
