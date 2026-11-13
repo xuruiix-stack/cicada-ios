@@ -78,11 +78,15 @@ final class AppModel: ObservableObject {
     init() {
         // store and recorder are nested ObservableObjects; their changes don't fire
         // AppModel.objectWillChange on their own, so forward them (elapsed, level,
-        // liveText and isRecording would otherwise never re-render).
+        // liveText and isRecording would otherwise never re-render). ai too: the
+        // Settings check status (AIClient.status) would never re-render without it.
         recorder.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &subs)
         store.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &subs)
+        ai.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &subs)
         // Recording errors (disk full, write failure) are set on Recorder.error
@@ -492,7 +496,9 @@ final class AppModel: ObservableObject {
                     // the user can tell a fallback transcript from a real one.
                     s.failedChunkCount = failedChunks
                     if failedChunks > 0 {
-                        errors.append("Server transcription failed for all \(failedChunks) audio chunk(s).")
+                        // Name the host, like the thrown errors do (item 2): the
+                        // user may have more than one service configured over time.
+                        errors.append("Transcription on \(ai.baseURLHost) failed for all \(failedChunks) audio chunk(s).")
                     }
                     store.save(s)
                 }
@@ -523,8 +529,16 @@ final class AppModel: ObservableObject {
 
         // Step 3 — notes. Runs whenever ANY transcript text exists (server
         // transcript or the liveText fallback line); a step-1/2 error above
-        // does not skip it.
-        let transcript = s.lines.map { "Speaker \($0.speaker): \($0.src)" }.joined(separator: "\n")
+        // does not skip it. Speaker labels match the transcript rows: an
+        // unidentified voice is "Unknown", not a false "Speaker 1".
+        let numbers = SpeakerLabels.voiceNumbers(s.lines)
+        let transcript = s.lines.map { l -> String in
+            let who: String
+            if let v = l.voice, let n = numbers[v] { who = "Speaker \(n)" }
+            else if numbers.isEmpty { who = "Speaker \(l.speaker)" }
+            else { who = "Unknown" }
+            return "\(who): \(l.src)"
+        }.joined(separator: "\n")
         if !transcript.isEmpty {
             do { s.notes = try await ai.meetingNotes(transcript: transcript) }
             catch { errors.append("Notes failed: \(error.localizedDescription)") }
@@ -666,7 +680,11 @@ struct RecordDetail: View {
                     Text("Transcript").tag(0); Text("Notes").tag(1)
                 }.pickerStyle(.segmented).padding(.top, 16)
                 if page == 0 {
-                    ForEach(session.lines) { l in TranscriptRow(line: l) }
+                    // Speaker labels need the whole session's voice numbers (a voice
+                    // gets a number only once two voices are on show), so compute
+                    // them here once instead of per row.
+                    let numbers = SpeakerLabels.voiceNumbers(session.lines)
+                    ForEach(session.lines) { l in TranscriptRow(line: l, numbers: numbers) }
                     if session.lines.isEmpty {
                         Text("No transcript yet.").foregroundStyle(Ink.secondary).padding(.top, 24)
                         // The offline case, said plainly: the recording exists and
@@ -743,12 +761,41 @@ struct RecordingBanner: View {
 
 struct TranscriptRow: View {
     let line: TranscriptLine
+    /// Speaker numbers in force for this transcript (SpeakerLabels.voiceNumbers of
+    /// the whole session, computed once by the caller — the row only renders).
+    var numbers: [Int: Int] = [:]
+
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Text("S\(line.speaker)").font(.caption.bold())
-                .foregroundStyle(SpeakerInk.ink(line.speaker))
-                .padding(.horizontal, 8).padding(.vertical, 4)
-                .background(SpeakerInk.tint(line.speaker), in: Capsule())
+            // Only a voice that was actually identified claims a speaker number.
+            // A line whose voice never reached the shown count (too short, unlike
+            // every known voice, or below voiceNumbers' two-voice threshold) used
+            // to render as S1 — falsely claiming the main speaker. It now shows
+            // upstream's "未识别" label instead, and only once SOME voice is on
+            // show: a genuine solo recording keeps its S1 on every line. The
+            // branch order matches TranscriptExport.markdown, so the export and
+            // the screen never disagree about who spoke.
+            if let name = line.speakerName {
+                Text(name).font(.caption.bold())
+                    .foregroundStyle(SpeakerInk.ink(line.speaker))
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(SpeakerInk.tint(line.speaker), in: Capsule())
+            } else if let v = line.voice, let n = numbers[v] {
+                Text("S\(n)").font(.caption.bold())
+                    .foregroundStyle(SpeakerInk.ink(n))
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(SpeakerInk.tint(n), in: Capsule())
+            } else if numbers.isEmpty {
+                Text("S\(line.speaker)").font(.caption.bold())
+                    .foregroundStyle(SpeakerInk.ink(line.speaker))
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(SpeakerInk.tint(line.speaker), in: Capsule())
+            } else {
+                Text("未识别").font(.caption.weight(.semibold))
+                    .foregroundStyle(Ink.tertiary)
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(Ink.line.opacity(0.5), in: Capsule())
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Text(line.src).font(.body)
                 if let d = line.dst, d != line.src { Text(d).font(.body).foregroundStyle(Ink.secondary) }
@@ -836,12 +883,24 @@ struct SettingsView: View {
                 SecureField("API key", text: $keyDraft, prompt: Text("sk-…"))
                     .textInputAutocapitalization(.never).autocorrectionDisabled()
                     .onSubmit(saveKey)
-                if AISettings.hasKey { Button("Save key") { saveKey() } }
+                // First-time setup must have a way to save: the button used to show
+                // only when a key already existed, so the very first paste was lost
+                // unless the keyboard's return key was pressed. Shown whenever the
+                // field has content, saved or not.
+                if !keyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Button("Save key") { saveKey() }
+                }
                 HStack {
-                    Circle().fill(AISettings.isConfigured ? Ink.ok : Color.gray).frame(width: 8, height: 8)
-                    Text(AISettings.isConfigured ? "Connected" : "Not set up").foregroundStyle(Ink.secondary)
+                    // The check's own result (AIClient.status), not mere key
+                    // existence: a refused key and a working one used to look
+                    // identical ("Connected" meant "a key is stored").
+                    checkStatusView
                     Spacer()
                     Button("Check") { Task { _ = await model.ai.checkKey() } }
+                        .disabled(checkRunning)
+                }
+                if case .failed(let reason) = model.ai.status {
+                    Text(reason).font(.footnote).foregroundStyle(Ink.accentText)
                 }
                 TextField("Chat model", text: $chatModel).onChange(of: chatModel, perform: { _ in AISettings.chatModel = chatModel })
                 TextField("Transcription model", text: $transcribeModel).onChange(of: transcribeModel, perform: { _ in AISettings.transcribeModel = transcribeModel })
@@ -868,5 +927,35 @@ struct SettingsView: View {
         guard !k.isEmpty else { return }
         Keychain.set(k, for: AISettings.keyKey); keyDraft = ""
         Task { _ = await model.ai.checkKey() }
+    }
+
+    private var checkRunning: Bool { model.ai.status == .checking }
+
+    /// The status dot + word for the check result: checking spinner, OK, or a
+    /// plain "not set up" only when nothing is configured at all. The failure
+    /// reason prints on its own row below (checkStatusReason).
+    @ViewBuilder private var checkStatusView: some View {
+        switch model.ai.status {
+        case .checking:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("Checking…").foregroundStyle(Ink.secondary)
+            }
+        case .ok:
+            HStack(spacing: 6) {
+                Circle().fill(Ink.ok).frame(width: 8, height: 8)
+                Text("Connected").foregroundStyle(Ink.secondary)
+            }
+        case .failed:
+            HStack(spacing: 6) {
+                Circle().fill(Ink.accent).frame(width: 8, height: 8)
+                Text("Check failed").foregroundStyle(Ink.secondary)
+            }
+        case .idle:
+            HStack(spacing: 6) {
+                Circle().fill(AISettings.isConfigured ? Ink.ok : Color.gray).frame(width: 8, height: 8)
+                Text(AISettings.isConfigured ? "Key saved" : "Not set up").foregroundStyle(Ink.secondary)
+            }
+        }
     }
 }
