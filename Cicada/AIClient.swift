@@ -11,6 +11,11 @@ enum AISettings {
     static let transcribeModelKey = "ai.transcribeModel"
     static let targetLangKey = "ai.targetLang"
     static let simultaneousInterpretationKey = "ai.simultaneousInterpretation"
+    // Optional separate notes service (upstream v1.9.0's 纪要另一个服务): stored the
+    // same way as the main service. Empty values mean "use the main service's".
+    static let notesBaseURLKey = "ai.notes.baseURL"
+    static let notesKeyKey = "ai.notes.apiKey"      // stored in Keychain, not UserDefaults
+    static let notesChatModelKey = "ai.notes.chatModel"
 
     static var baseURL: String {
         get { UserDefaults.standard.string(forKey: baseURLKey) ?? "" }
@@ -36,6 +41,25 @@ enum AISettings {
     }
     static var hasKey: Bool { Keychain.string(for: keyKey) != nil }
     static var isConfigured: Bool { !baseURL.isEmpty && hasKey }
+
+    static var notesBaseURL: String {
+        get { UserDefaults.standard.string(forKey: notesBaseURLKey) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: notesBaseURLKey) }
+    }
+    static var notesChatModel: String {
+        get { UserDefaults.standard.string(forKey: notesChatModelKey) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: notesChatModelKey) }
+    }
+    static var hasNotesKey: Bool { Keychain.string(for: notesKeyKey) != nil }
+    /// The notes service is apart only when its own address is set (upstream's
+    /// notesApart): a notes model alone reuses the main address and key.
+    static var notesApart: Bool { !notesBaseURL.isEmpty }
+    /// Notes calls resolve their key through this: the notes key when one was
+    /// saved, else the main key (upstream's rule — an empty field must not
+    /// force the user to paste the same key twice).
+    static var notesKeyOrMain: String? {
+        Keychain.string(for: notesKeyKey) ?? Keychain.string(for: keyKey)
+    }
 }
 
 enum Keychain {
@@ -127,19 +151,62 @@ final class AIClient: ObservableObject {
     /// The Settings AI section renders this (checking spinner / OK / failure
     /// reason). Replaces the old String status, which no view ever read.
     @Published var status: AIStatus = .idle
+    /// The same check, for the optional notes service (Settings shows it only
+    /// when the notes address is configured). Kept separate from `status` so
+    /// the two rows each tell their own truth.
+    @Published var notesStatus: AIStatus = .idle
 
-    private func endpoint(_ path: String) throws -> URL {
-        guard AISettings.isConfigured, let key = Keychain.string(for: AISettings.keyKey) else { throw AIError.notConfigured }
-        _ = key
-        var b = AISettings.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// Which service a call goes to (upstream v1.9.0's priority: .notes
+    /// side). The transcription and translate steps always use .main; only
+    /// the notes step resolves .notes, and .notes falls back to the main
+    /// service's settings whenever the notes configuration is empty.
+    enum Side {
+        case main
+        case notes
+        /// The address in force for this side (scheme optional, as typed).
+        var baseURL: String {
+            switch self {
+            case .main: return AISettings.baseURL
+            // Empty notes address = notes are not apart; reuse the main one.
+            case .notes: return AISettings.notesBaseURL.isEmpty ? AISettings.baseURL : AISettings.notesBaseURL
+            }
+        }
+        var key: String? {
+            switch self {
+            case .main: return Keychain.string(for: AISettings.keyKey)
+            // Upstream's rule: the notes key when one was saved, else the main key.
+            case .notes: return AISettings.notesKeyOrMain
+            }
+        }
+        var chatModel: String {
+            switch self {
+            case .main: return AISettings.chatModel
+            // Empty notes model = same model as the main service.
+            case .notes: return AISettings.notesChatModel.isEmpty ? AISettings.chatModel : AISettings.notesChatModel
+            }
+        }
+        var isConfigured: Bool { !baseURL.isEmpty && key != nil }
+        /// Host of this side's address, for error messages that name the
+        /// service (round 2's rule) — with a separate notes service, the user
+        /// must be able to tell WHICH key to fix.
+        var host: String {
+            var b = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !b.contains("://") { b = "https://" + b }
+            return (URL(string: b)?.host ?? b).lowercased()
+        }
+    }
+
+    private func endpoint(_ path: String, on side: Side = .main) throws -> URL {
+        guard side.isConfigured else { throw AIError.notConfigured }
+        var b = side.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if !b.contains("://") { b = "https://" + b }
         if !b.hasSuffix("/") { b += "/" }
         guard let u = URL(string: b + path) else { throw AIError.notConfigured }
         return u
     }
-    private func request(to url: URL) -> URLRequest {
+    private func request(to url: URL, on side: Side = .main) -> URLRequest {
         var r = URLRequest(url: url); r.timeoutInterval = CicadaTuning.notesTimeout
-        r.setValue("Bearer \(Keychain.string(for: AISettings.keyKey) ?? "")", forHTTPHeaderField: "Authorization")
+        r.setValue("Bearer \(side.key ?? "")", forHTTPHeaderField: "Authorization")
         r.setValue("application/json", forHTTPHeaderField: "Content-Type")
         return r
     }
@@ -164,9 +231,9 @@ final class AIClient: ObservableObject {
         return .http(code, bodyDetail(data), host: host)
     }
 
-    func chat(system: String, user: String, json: Bool = false) async throws -> String {
-        let url = try endpoint("chat/completions")
-        var r = request(to: url); r.httpMethod = "POST"
+    func chat(system: String, user: String, json: Bool = false, on side: Side = .main) async throws -> String {
+        let url = try endpoint("chat/completions", on: side)
+        var r = request(to: url, on: side); r.httpMethod = "POST"
         // Long transcripts (a 4+ minute recording joined into one prompt) make
         // the notes/translate generation slow; the default 90 s timeout
         // (CicadaTuning.notesTimeout) aborts the call mid-generation and the
@@ -174,7 +241,7 @@ final class AIClient: ObservableObject {
         // silently dropping the transcript: 90 s + 5 s per 100 characters,
         // capped at 5 minutes. Short prompts keep the original 90 s.
         r.timeoutInterval = min(300, CicadaTuning.notesTimeout + Double(user.count) / 20)
-        let body: [String: Any] = ["model": AISettings.chatModel,
+        let body: [String: Any] = ["model": side.chatModel,
             "messages": [["role": "system", "content": system], ["role": "user", "content": user]],
             "temperature": 0.3, "max_tokens": CicadaTuning.notesMaxTokens]
         r.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -501,12 +568,16 @@ final class AIClient: ObservableObject {
     }
 
     /// Structured meeting notes: summary, topics, conclusions, action items.
+    /// Sent through the notes service when one is configured (upstream
+    /// v1.9.0's 纪要另一个服务), else the main service exactly as before —
+    /// same machinery either way, so the errors name the host that answered.
     func meetingNotes(transcript: String) async throws -> MeetingNotes {
+        let side: Side = AISettings.notesApart ? .notes : .main
         let raw = try await chat(
             system: "You write structured meeting notes. Reply with JSON only: {\"summary\":string,\"topics\":[{\"title\":string,\"points\":[string]}],\"conclusions\":[string],\"actionItems\":[{\"text\":string,\"owner\":string|null}]}",
-            user: transcript, json: true)
+            user: transcript, json: true, on: side)
         guard let j = extractNotesJSON(from: raw) else {
-            throw AIError.unparsableNotes(host: baseURLHost) }
+            throw AIError.unparsableNotes(host: side.host) }
         var n = MeetingNotes(); n.summary = j["summary"] as? String ?? ""
         n.conclusions = (j["conclusions"] as? [String]) ?? []
         for t in (j["topics"] as? [[String: Any]] ?? []) {
@@ -524,5 +595,15 @@ final class AIClient: ObservableObject {
         status = .checking
         do { _ = try await chat(system: "Reply OK", user: "ping"); status = .ok; return true }
         catch { status = .failed(error.localizedDescription); return false }
+    }
+
+    /// The same check for the notes service, shown in Settings only when the
+    /// notes address is configured. Mirrors checkKey() but pings the notes
+    /// side (its address, its key when one was saved, its model), so a notes
+    /// service that is down never paints the main row red.
+    func checkNotes() async -> Bool {
+        notesStatus = .checking
+        do { _ = try await chat(system: "Reply OK", user: "ping", on: .notes); notesStatus = .ok; return true }
+        catch { notesStatus = .failed(error.localizedDescription); return false }
     }
 }
