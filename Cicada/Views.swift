@@ -3,6 +3,7 @@ import AVFoundation
 import Combine
 import Network
 import UIKit
+import UniformTypeIdentifiers
 
 // MARK: - App model wiring record / transcribe / translate / notes
 
@@ -11,6 +12,10 @@ final class AppModel: ObservableObject {
     @Published var store = SessionStore()
     @Published var ai = AIClient()
     @Published var recorder = Recorder()
+    /// Auto-save Markdown to the chosen folder (item 3): owns the bookmark's
+    /// lifecycle; its failures surface through `message`, never through the
+    /// pipeline.
+    @Published var exporter = FolderExporter()
     @Published var tab: Tab = .records
     @Published var selection: String?
     @Published var busy = false
@@ -89,6 +94,12 @@ final class AppModel: ObservableObject {
         ai.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &subs)
+        // Folder export (item 3): the Settings rows read FolderSettings
+        // through the exporter; its change (folder chosen / forgotten) must
+        // re-render them, which needs this forward like the others above.
+        exporter.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &subs)
         // Recording errors (disk full, write failure) are set on Recorder.error
         // from tap/interruption contexts that have no UI of their own; surface
         // them as the app-level alert. objectWillChange fires before the change
@@ -135,6 +146,11 @@ final class AppModel: ObservableObject {
         // "recording" and the partial audio is kept, not lost behind a stuck timer.
         recorder.onRecordingLost = { [weak self] _ in
             self?.stopRecording()
+        }
+        // Folder export problems (stale bookmark, write error) arrive after the
+        // pipeline is done; show them as the app alert, once per failure text.
+        exporter.onSurface = { [weak self] text in
+            self?.message = text
         }
         // A pause whose interruption ended while the app was still behind a
         // call screen could not take the microphone back yet (upstream's
@@ -550,6 +566,12 @@ final class AppModel: ObservableObject {
         s.processingState = (s.lastError == nil) ? .done : .failed
         store.save(s)
         if let e = s.lastError { message = e }
+        // Auto-save Markdown (item 3): once the transcript + notes are saved on
+        // the session, its Markdown goes into the user's chosen folder. Strictly
+        // after the final save, and its own do/catch: a stale bookmark or a write
+        // error is logged and surfaced by the exporter, never a pipeline failure
+        // or a block on the session that just finished. No folder chosen: nothing.
+        if !s.lines.isEmpty { exporter.write(s) }
     }
 
     func exportMarkdown(_ s: Session) -> String { TranscriptExport.markdown(s) }
@@ -665,63 +687,124 @@ struct RecordDetail: View {
     @EnvironmentObject var model: AppModel
     let session: Session
     @State private var page = 0
+    @StateObject private var player = RecordPlayer()
+    /// True while the list should follow the playing line (ScrollViewReader);
+    /// a manual scroll stops the following until playback seeks again, so the
+    /// user can read elsewhere without the list fighting them (the Mac's
+    /// `following` rule).
+    @State private var following = true
+
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 0) {
-                // Safety net: if this page is showing while a recording runs (e.g. the
-                // user opened an old session mid-recording), Stop is reachable here.
-                if model.recorder.isRecording {
-                    RecordingBanner()
-                }
-                Text(TranscriptExport.displayTitle(session)).font(.title.bold())
-                Text("\(Int(session.duration/60)) min · \(session.lines.count) lines")
-                    .font(.footnote).foregroundStyle(Ink.secondary).padding(.top, 4)
-                Picker("Page", selection: $page) {
-                    Text("Transcript").tag(0); Text("Notes").tag(1)
-                }.pickerStyle(.segmented).padding(.top, 16)
-                if page == 0 {
-                    // Speaker labels need the whole session's voice numbers (a voice
-                    // gets a number only once two voices are on show), so compute
-                    // them here once instead of per row.
-                    let numbers = SpeakerLabels.voiceNumbers(session.lines)
-                    ForEach(session.lines) { l in TranscriptRow(line: l, numbers: numbers) }
-                    if session.lines.isEmpty {
-                        Text("No transcript yet.").foregroundStyle(Ink.secondary).padding(.top, 24)
-                        // The offline case, said plainly: the recording exists and
-                        // is safe, the cloud transcription needs the network, and
-                        // it will be retried automatically when signal returns.
-                        if !session.transcribed, session.audioFile != nil, !model.networkAvailable {
-                            Text("You appear to be offline — the audio is saved, and the transcript will be generated automatically once the network is back.")
-                                .font(.footnote).foregroundStyle(Ink.secondary).padding(.top, 6)
-                        }
-                        // Why the live captions (and thus the fallback line)
-                        // never came — e.g. the on-device model for this
-                        // language was never downloaded. Persisted with the
-                        // session at stop, so it survives relaunch.
-                        if let note = session.liveCaptionNote {
-                            Text(note).font(.footnote).foregroundStyle(Ink.secondary).padding(.top, 6)
-                        }
+        // The line at the playback position (the official app's lineID, +0.2 s
+        // tolerance), recomputed on every player tick; the rows and the
+        // follow-scroll both read it.
+        let playing = player.lineID(in: session)
+        return ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    // Safety net: if this page is showing while a recording runs (e.g. the
+                    // user opened an old session mid-recording), Stop is reachable here.
+                    if model.recorder.isRecording {
+                        RecordingBanner()
                     }
-                } else {
-                    NotesView(notes: session.notes, state: session.processingState,
-                              lastError: session.lastError, failedChunks: session.failedChunkCount)
+                    Text(TranscriptExport.displayTitle(session)).font(.title.bold())
+                    Text("\(Int(session.duration/60)) min · \(session.lines.count) lines")
+                        .font(.footnote).foregroundStyle(Ink.secondary).padding(.top, 4)
+                    Picker("Page", selection: $page) {
+                        Text("Transcript").tag(0); Text("Notes").tag(1)
+                    }.pickerStyle(.segmented).padding(.top, 16)
+                    if page == 0 {
+                        // Speaker labels need the whole session's voice numbers (a voice
+                        // gets a number only once two voices are on show), so compute
+                        // them here once instead of per row.
+                        let numbers = SpeakerLabels.voiceNumbers(session.lines)
+                        ForEach(session.lines) { l in
+                            TranscriptRow(line: l, numbers: numbers, playing: l.id == playing)
+                                .id(l.id)
+                                // Tapping a line starts playback from its timestamp
+                                // (the official app's seek-on-line-tap).
+                                .contentShape(Rectangle())
+                                .onTapGesture { following = true; player.seek(l.t) }
+                        }
+                        if session.lines.isEmpty {
+                            Text("No transcript yet.").foregroundStyle(Ink.secondary).padding(.top, 24)
+                            // The offline case, said plainly: the recording exists and
+                            // is safe, the cloud transcription needs the network, and
+                            // it will be retried automatically when signal returns.
+                            if !session.transcribed, session.audioFile != nil, !model.networkAvailable {
+                                Text("You appear to be offline — the audio is saved, and the transcript will be generated automatically once the network is back.")
+                                    .font(.footnote).foregroundStyle(Ink.secondary).padding(.top, 6)
+                            }
+                            // Why the live captions (and thus the fallback line)
+                            // never came — e.g. the on-device model for this
+                            // language was never downloaded. Persisted with the
+                            // session at stop, so it survives relaunch.
+                            if let note = session.liveCaptionNote {
+                                Text(note).font(.footnote).foregroundStyle(Ink.secondary).padding(.top, 6)
+                            }
+                        }
+                    } else {
+                        NotesView(notes: session.notes, state: session.processingState,
+                                  lastError: session.lastError, failedChunks: session.failedChunkCount)
+                    }
+                }
+                .padding(.horizontal, 20).padding(.top, 8)
+                // The player bar overlays the bottom of the scroll; extra bottom
+                // padding keeps the last line clear of it.
+                .padding(.bottom, player.available ? 96 : 24)
+            }
+            // A manual scroll stops the following (the Mac's `following` rule):
+            // the list must not fight the reader who went looking elsewhere.
+            // simultaneousGesture + a minimum distance keeps the ScrollView's
+            // own pan in charge (iOS 16.4-safe; no iOS 17 scroll APIs).
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 25).onChanged { _ in
+                    // Only while playing: at rest there is nothing to follow and
+                    // any pan (e.g. system gestures) must not touch the flag.
+                    if player.playing { following = false }
+                }
+            )
+            // The list follows the playing line while `following` holds; any
+            // seek (line tap, play) re-arms it.
+            .onChange(of: playing) { id in
+                guard following, let id, player.playing || player.now > 0 else { return }
+                proxy.scrollTo(id, anchor: .center)
+            }
+            .safeAreaInset(edge: .bottom) {
+                if player.available {
+                    PlayerBar(player: player).padding(.bottom, 8)
                 }
             }
-            .padding(.horizontal, 20).padding(.top, 8)
-        }
-        .navigationTitle("").navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                Button { model.selection = nil } label: {
-                    Image(systemName: "chevron.left")
-                }
-                Button { Task { await model.process(session) } } label: {
-                    model.busy ? AnyView(ProgressView()) : AnyView(Image(systemName: "arrow.triangle.2.circlepath"))
-                }.disabled(model.busy || model.recorder.isRecording)
-                ShareLink(item: model.exportMarkdown(session), subject: Text(TranscriptExport.displayTitle(session))) {
-                    Image(systemName: "square.and.arrow.up")
+            .navigationTitle("").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button { model.selection = nil } label: {
+                        Image(systemName: "chevron.left")
+                    }
+                    Button { Task { await model.process(session) } } label: {
+                        model.busy ? AnyView(ProgressView()) : AnyView(Image(systemName: "arrow.triangle.2.circlepath"))
+                    }.disabled(model.busy || model.recorder.isRecording)
+                    ShareLink(item: model.exportMarkdown(session), subject: Text(TranscriptExport.displayTitle(session))) {
+                        Image(systemName: "square.and.arrow.up")
+                    }
                 }
             }
+            .onAppear {
+                // The player and the recorder share one AVAudioSession: the
+                // player may switch it to .playback only when the recorder is
+                // not mid-recording (see RecordPlayer.mayOwnSession). The
+                // model lives for the app's lifetime, so the strong capture
+                // is safe.
+                player.mayOwnSession = { !model.recorder.isRecording }
+                player.load(store: model.store, session: session)
+            }
+            // The detail view is reused when another record is picked
+            // (selection changes, the view re-inits with the new session):
+            // swap the player's audio to the new session's recording.
+            .onChange(of: session.id) { _ in
+                player.load(store: model.store, session: session)
+            }
+            .onDisappear { player.stop() }   // leaving the screen stops playback
         }
     }
 }
@@ -764,6 +847,9 @@ struct TranscriptRow: View {
     /// Speaker numbers in force for this transcript (SpeakerLabels.voiceNumbers of
     /// the whole session, computed once by the caller — the row only renders).
     var numbers: [Int: Int] = [:]
+    /// True when the playback position is on this line (the official app's
+    /// row highlight: a light accent wash, the same 0.06 opacity as its).
+    var playing: Bool = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -801,7 +887,11 @@ struct TranscriptRow: View {
                 if let d = line.dst, d != line.src { Text(d).font(.body).foregroundStyle(Ink.secondary) }
                 Text(TranscriptExport.clock(line.t)).font(.caption).foregroundStyle(Ink.tertiary)
             }
-        }.padding(.vertical, 6)
+        }
+        .padding(.vertical, 6)
+        // The playing line's highlight, the official app's 0.06 accent wash
+        // over the whole row (not just the text column).
+        .background(playing ? Ink.accent.opacity(0.06) : .clear, in: Rectangle())
     }
 }
 
@@ -874,6 +964,12 @@ struct SettingsView: View {
     @State private var transcribeModel = AISettings.transcribeModel
     @State private var targetLang = AISettings.targetLang
     @State private var simultaneousInterpretation = AISettings.simultaneousInterpretation
+    // Optional notes service (item 2): empty = use the main service's fields.
+    @State private var notesBaseURL = AISettings.notesBaseURL
+    @State private var notesKeyDraft = ""
+    @State private var notesChatModel = AISettings.notesChatModel
+    // Auto-save folder (item 3).
+    @State private var showFolderPicker = false
     var body: some View {
         Form {
             Section("AI Service (OpenAI-compatible)") {
@@ -911,6 +1007,61 @@ struct SettingsView: View {
                     .onChange(of: simultaneousInterpretation, perform: { _ in AISettings.simultaneousInterpretation = simultaneousInterpretation })
                 if AISettings.hasKey { Button("Remove key", role: .destructive) { Keychain.remove(for: AISettings.keyKey); keyDraft = "" } }
             }
+            Section("Notes service (optional)") {
+                // Upstream v1.9.0 parity: notes can run on their own service.
+                // Empty fields mean "same as the main service" — that is the
+                // documented behaviour, not a missing setting.
+                TextField("Base URL", text: $notesBaseURL, prompt: Text("Empty = the main service"))
+                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    .onChange(of: notesBaseURL) { _ in
+                        AISettings.notesBaseURL = notesBaseURL
+                        // The check row appears/disappears with the address;
+                        // a half-configured state must not keep a stale result.
+                        if !AISettings.notesApart { model.ai.notesStatus = .idle }
+                    }
+                SecureField("API key", text: $notesKeyDraft, prompt: Text("Empty = the main key"))
+                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    .onSubmit(saveNotesKey)
+                if !notesKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Button("Save key") { saveNotesKey() }
+                }
+                // The check action only exists when the notes service is
+                // configured (a notes address is set), mirroring the main one.
+                if AISettings.notesApart {
+                    HStack {
+                        notesCheckStatusView
+                        Spacer()
+                        Button("Check") { Task { _ = await model.ai.checkNotes() } }
+                            .disabled(notesCheckRunning)
+                    }
+                    if case .failed(let reason) = model.ai.notesStatus {
+                        Text(reason).font(.footnote).foregroundStyle(Ink.accentText)
+                    }
+                }
+                TextField("Notes model", text: $notesChatModel, prompt: Text("Empty = the chat model"))
+                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    .onChange(of: notesChatModel) { _ in AISettings.notesChatModel = notesChatModel }
+                if AISettings.hasNotesKey {
+                    Button("Remove notes key", role: .destructive) {
+                        Keychain.remove(for: AISettings.notesKeyKey); notesKeyDraft = ""
+                    }
+                }
+            }
+            Section("Auto-save to folder") {
+                // The chosen folder's name, or the offer to pick one. The
+                // bookmark (the actual grant) lives in FolderSettings; this
+                // row only shows what the user picked.
+                if FolderSettings.hasFolder {
+                    Text("Saving to “\(FolderExporter.folderDisplayName)”")
+                        .font(.footnote).foregroundStyle(Ink.secondary)
+                    Button("Choose a different folder") { showFolderPicker = true }
+                    Button("Stop auto-saving", role: .destructive) { model.exporter.forget() }
+                } else {
+                    Text("After processing, the meeting's Markdown is written into a folder you pick — a notes vault, a synced folder, or anywhere in Files.")
+                        .font(.footnote).foregroundStyle(Ink.secondary)
+                    Button("Choose folder…") { showFolderPicker = true }
+                }
+            }
             Section("Privacy") {
                 Text("Recordings and notes stay on this device. Audio is sent only to the service you configure above.")
                     .font(.footnote).foregroundStyle(Ink.secondary)
@@ -921,6 +1072,12 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
+        .fileImporter(isPresented: $showFolderPicker, allowedContentTypes: [.folder]) { result in
+            // The picker grants access to the URL for this callback only;
+            // choose() turns it into a security-scoped bookmark, which is
+            // what persists the grant across launches.
+            if case .success(let url) = result { model.exporter.choose(url) }
+        }
     }
     private func saveKey() {
         let k = keyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -928,8 +1085,16 @@ struct SettingsView: View {
         Keychain.set(k, for: AISettings.keyKey); keyDraft = ""
         Task { _ = await model.ai.checkKey() }
     }
+    /// Same shape as saveKey(), for the notes service's own key.
+    private func saveNotesKey() {
+        let k = notesKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !k.isEmpty else { return }
+        Keychain.set(k, for: AISettings.notesKeyKey); notesKeyDraft = ""
+        if AISettings.notesApart { Task { _ = await model.ai.checkNotes() } }
+    }
 
     private var checkRunning: Bool { model.ai.status == .checking }
+    private var notesCheckRunning: Bool { model.ai.notesStatus == .checking }
 
     /// The status dot + word for the check result: checking spinner, OK, or a
     /// plain "not set up" only when nothing is configured at all. The failure
@@ -955,6 +1120,34 @@ struct SettingsView: View {
             HStack(spacing: 6) {
                 Circle().fill(AISettings.isConfigured ? Ink.ok : Color.gray).frame(width: 8, height: 8)
                 Text(AISettings.isConfigured ? "Key saved" : "Not set up").foregroundStyle(Ink.secondary)
+            }
+        }
+    }
+
+    /// The notes check's status, mirroring checkStatusView. Only shown when a
+    /// notes address is configured (the check pings that address, with the
+    /// notes key when one was saved, else the main key).
+    @ViewBuilder private var notesCheckStatusView: some View {
+        switch model.ai.notesStatus {
+        case .checking:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("Checking…").foregroundStyle(Ink.secondary)
+            }
+        case .ok:
+            HStack(spacing: 6) {
+                Circle().fill(Ink.ok).frame(width: 8, height: 8)
+                Text("Connected").foregroundStyle(Ink.secondary)
+            }
+        case .failed:
+            HStack(spacing: 6) {
+                Circle().fill(Ink.accent).frame(width: 8, height: 8)
+                Text("Check failed").foregroundStyle(Ink.secondary)
+            }
+        case .idle:
+            HStack(spacing: 6) {
+                Circle().fill(Color.gray).frame(width: 8, height: 8)
+                Text("Not checked yet").foregroundStyle(Ink.secondary)
             }
         }
     }
