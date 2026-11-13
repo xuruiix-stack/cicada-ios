@@ -21,10 +21,19 @@ final class Recorder: NSObject, ObservableObject {
     @Published var elapsed: Double = 0
     @Published var liveText = ""
     @Published var error: String?
+    /// True while a call, Siri or another app took the audio and we are waiting
+    /// for it back. The recording page shows it so "Paused" is never mistaken
+    /// for silence or a dead mic; elapsed keeps running (meeting time does).
+    @Published private(set) var paused = false
     /// Why on-device recognition isn't producing live captions (model not
     /// downloaded, locale unsupported, recognizer failed…). The recording
     /// page shows it so a silent failure is never mistaken for silence.
     @Published var recognitionError: String?
+    /// The recording could not go on (interruption ended without the system
+    /// giving the audio back, or the engine could not be restarted). Set at
+    /// most once per recording; AppModel finalizes the partial recording
+    /// truthfully instead of leaving the UI claim "recording".
+    var onRecordingLost: ((String) -> Void)?
 
     /// Segments closed since the last read (speaker separation). Published on the main
     /// thread; the tap hands them over there. The consumer (AppModel) reads and clears.
@@ -38,6 +47,14 @@ final class Recorder: NSObject, ObservableObject {
     private var file: AVAudioFile?
     private var timer: Timer?
     private var startedAt = Date()
+    /// Interruption / route-change observers, torn down in stop().
+    private var observers: [NSObjectProtocol] = []
+    /// Inside an interruption: a route change then must not try to take the
+    /// microphone back (upstream RoomAudio's `held` rule).
+    private var held = false
+    /// True when a resume must wait for the app to become active again (the
+    /// interruption ended while the app was still behind a call screen).
+    private var resumeWhenActive = false
     private var recognizer: SFSpeechRecognizer?
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
@@ -165,6 +182,136 @@ final class Recorder: NSObject, ObservableObject {
         } else {
             recognitionError = "No speech recognizer exists for this language, so there are no offline live captions. The recording itself is unaffected; the transcript will be generated when online."
         }
+        observeAudioSession()
+    }
+
+    // MARK: - Interruption and route changes (upstream RoomListen/RoomAudio)
+
+    /// A call, Siri or another app taking the audio used to be the end of the
+    /// recording: the session went inactive, nothing fed the engine, and the
+    /// UI kept claiming "recording" while the file went silent — then iOS
+    /// suspended the background app for having no active audio. The pattern
+    /// here is the official iOS app's (RoomListen.swift): pause on
+    /// interruption began, take the microphone back when it ends
+    /// (shouldResume), and re-tap the engine in whatever format the new route
+    /// has. If the audio never comes back, say so and finalize truthfully.
+    private func observeAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        let center = NotificationCenter.default
+        observers = [
+            center.addObserver(forName: AVAudioSession.interruptionNotification, object: session, queue: .main) {
+                [weak self] n in self?.interrupted(n)
+            },
+            // A route change (headphones out, Bluetooth off) stops the engine
+            // with a configuration change: on again in the new input's format,
+            // unless an interruption is holding the audio (upstream's rule).
+            center.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) {
+                [weak self] _ in self?.routeChanged()
+            },
+        ]
+    }
+
+    private func interrupted(_ n: Notification) {
+        guard isRecording, let raw = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+        if type == .began {
+            guard !paused else { return }
+            held = true
+            paused = true
+            level = 0
+            engine?.pause()
+            debugLog("recorder: interruption began")
+            return
+        }
+        // Interruption ended: only resume when the system says it's ours to take.
+        let optionsRaw = n.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+        let shouldResume = AVAudioSession.InterruptionOptions(rawValue: optionsRaw).contains(.shouldResume)
+        debugLog("recorder: interruption ended shouldResume=\(shouldResume)")
+        guard paused else { return }
+        if shouldResume {
+            do { try resume() }
+            catch {
+                // The system won't hand the microphone back yet (the app can
+                // still be behind a call screen): try again on activation.
+                debugLog("recorder: resume failed: \(error.localizedDescription)")
+                resumeWhenActive = true
+            }
+        } else {
+            // Not ours to take back (a call still going in the background):
+            // wait for the app to become active, and give up honestly if
+            // even then the audio does not return.
+            resumeWhenActive = true
+        }
+    }
+
+    /// A route change with no interruption in flight: the engine stopped on a
+    /// configuration change (e.g. headphones unplugged), so start it again in
+    /// the new input format. The old device being gone is handled by the
+    /// engine itself (it re-reads the route); our job is to notice and re-tap.
+    private func routeChanged() {
+        guard isRecording, !held, !(engine?.isRunning ?? false) else { return }
+        debugLog("recorder: engine configuration changed, restarting")
+        do { try resume() }
+        catch {
+            debugLog("recorder: restart after route change failed: \(error.localizedDescription)")
+            recordingLost("The audio route changed and the microphone could not be recovered, so the recording was stopped.")
+        }
+    }
+
+    /// The microphone again after an interruption or route change, in whatever
+    /// format the route now has (upstream RoomAudio.resume): re-activate the
+    /// session, and re-tap the input when the engine is down. The file keeps
+    /// its 16 kHz format; only the tap's input format can change.
+    private func resume() throws {
+        held = false
+        resumeWhenActive = false
+        try AVAudioSession.sharedInstance().setActive(true)
+        if let engine, !engine.isRunning { try tapAndStart(engine: engine) }
+        paused = false
+        debugLog("recorder: resumed")
+    }
+
+    /// Re-tap the input at the route's current format and start the engine.
+    /// The converter is rebuilt for the new format; the file and the
+    /// recognizer keep receiving 16 kHz mono as before.
+    private func tapAndStart(engine: AVAudioEngine) throws {
+        guard let file else { return }
+        let input = engine.inputNode
+        input.removeTap(onBus: 0)
+        let tapFmt = input.outputFormat(forBus: 0)
+        guard let conv = AVAudioConverter(from: tapFmt, to: sinkFormat) else {
+            throw NSError(domain: AVFoundationErrorDomain, code: -10875,
+                          userInfo: [NSLocalizedDescriptionKey: "Cannot convert mic input (\(tapFmt)) to recording format."])
+        }
+        converter = conv
+        input.installTap(onBus: 0, bufferSize: 4096, format: tapFmt) { [weak self] buffer, _ in
+            self?.handle(buffer)
+        }
+        engine.prepare()
+        try engine.start()
+    }
+
+    /// The app became active again (scenePhase != background): a pause whose
+    /// interruption ended too early to take the microphone back gets another
+    /// try now (upstream's appBecameActive). Called by AppModel.
+    func appBecameActive() {
+        guard resumeWhenActive, isRecording, paused else { return }
+        do { try resume() }
+        catch {
+            debugLog("recorder: resume on activation failed: \(error.localizedDescription)")
+            // The audio is not coming back: keep the promise honest — the
+            // partial recording is finalized instead of "recording" forever.
+            recordingLost("The microphone could not be recovered after the interruption, so the recording was stopped. The audio up to that point is saved.")
+        }
+    }
+
+    /// Sets the failure note and hands the loss to AppModel once: the UI must
+    /// stop claiming "recording" the moment recording cannot continue.
+    private func recordingLost(_ why: String) {
+        guard isRecording else { return }
+        debugLog("recorder: recording lost: \(why)")
+        error = why
+        onRecordingLost?(why)
     }
 
     /// Turn a mid-run SFSpeechRecognizer error into something a person can
@@ -271,7 +418,9 @@ final class Recorder: NSObject, ObservableObject {
 
     func stop() -> URL? {
         timer?.invalidate(); timer = nil
+        observers.forEach(NotificationCenter.default.removeObserver); observers = []
         engine?.inputNode.removeTap(onBus: 0); engine?.stop(); engine = nil; converter = nil
+        held = false; resumeWhenActive = false
         request?.endAudio(); task?.cancel(); request = nil; task = nil; recognizer = nil
         // recognitionError stays readable until stopRecording() (AppModel)
         // moves it onto the session as liveCaptionNote; start() clears it.
@@ -281,7 +430,7 @@ final class Recorder: NSObject, ObservableObject {
         gateLock.lock()
         closeLockedSegment()
         gateLock.unlock()
-        isRecording = false; level = 0
+        isRecording = false; level = 0; paused = false
         let url = file?.url
         file = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)

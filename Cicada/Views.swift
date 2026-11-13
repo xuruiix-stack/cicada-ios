@@ -102,6 +102,20 @@ final class AppModel: ObservableObject {
             store.sessions[i].lastError = "Processing was interrupted before it finished."
             store.save(store.sessions[i])
         }
+        // Interruption handling (upstream RoomListen): when the audio cannot be
+        // taken back after a call/Siri/route change, the recorder tells us here
+        // and the session is finalized truthfully — the UI stops claiming
+        // "recording" and the partial audio is kept, not lost behind a stuck timer.
+        recorder.onRecordingLost = { [weak self] _ in
+            self?.stopRecording()
+        }
+        // A pause whose interruption ended while the app was still behind a
+        // call screen could not take the microphone back yet (upstream's
+        // resumeWhenActive): try again the moment we are the front app.
+        NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.recorder.appBecameActive()
+        }
         startNetworkMonitor()
     }
 
@@ -545,6 +559,10 @@ struct RecordsList: View {
                                     .opacity(0.4 + 0.6 * Double(model.recorder.level))
                                 Text(TranscriptExport.clock(model.recorder.elapsed)).font(.footnote.monospacedDigit())
                             }
+                            if model.recorder.paused {
+                                Text("Paused — the audio was taken by a call or another app; recording resumes when it ends.")
+                                    .font(.footnote).foregroundStyle(Ink.secondary)
+                            }
                             if !model.recorder.liveText.isEmpty {
                                 Text(model.recorder.liveText).font(.footnote)
                                     .foregroundStyle(Ink.secondary).lineLimit(2)
@@ -663,6 +681,10 @@ struct RecordingBanner: View {
                 }
                 Spacer()
                 Button("Stop", role: .destructive) { model.stopRecording() }
+            }
+            if model.recorder.paused {
+                Text("Paused — the audio was taken by a call or another app; recording resumes when it ends.")
+                    .font(.footnote).foregroundStyle(Ink.secondary)
             }
             if !model.recorder.liveText.isEmpty {
                 Text(model.recorder.liveText).font(.footnote)
