@@ -2,6 +2,7 @@ import Accelerate
 import AVFoundation
 import CoreML
 import Foundation
+import os
 
 // 说话人分离 (speaker diarization): each heard segment's audio becomes a voiceprint
 // (WeSpeaker ResNet34-LM, VoxCeleb, CC BY 4.0, bundled as Core ML), voiceprints are grouped
@@ -287,7 +288,14 @@ final class SpeakerTagger {
     }
 }
 
-/// A tiny debug log: the rebuild has no Diagnostics.swift; keep the failures findable in Console.
+/// A tiny debug log: the rebuild has no Diagnostics.swift; keep the failures
+/// findable in Console (sysdiagnose / `log stream --predicate 'subsystem == "com.wquguru.cicada"'`).
+/// os_log, not print: print goes to stdout only — invisible in Console and in
+/// device logs captured after a lock-screen kill, which is exactly where these
+/// records (interruption begin/end, engine restarts, killed-session recovery)
+/// need to be readable. Logger fits iOS 14+, so 16.4 is covered; the level is
+/// .default so the subsystem can be raised to .info/.debug when hunting.
 func debugLog(_ message: String) {
-    print("cicada: \(message)")
+    Logger(subsystem: "com.wquguru.cicada", category: "recorder")
+        .log("cicada: \(message, privacy: .public)")
 }
