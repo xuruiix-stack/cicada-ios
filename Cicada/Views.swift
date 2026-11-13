@@ -956,39 +956,41 @@ struct NotesView: View {
 
 // MARK: - Settings
 
-/// Folder picking through UIKit's document picker in a sheet: SwiftUI's
-/// .fileImporter failed to present at all on the target setup (iOS 16.4,
-/// TrollStore install), so the pick goes through UIDocumentPickerViewController
-/// directly — the same system UI and the same security-scoped URL, one less
-/// presentation layer in between.
-struct FolderPicker: UIViewControllerRepresentable {
-    var onPick: (URL) -> Void
-    @Environment(\.dismiss) private var dismiss
+/// Folder picking through UIKit's document picker, presented from the
+/// topmost view controller. Two presentation layers failed on the target
+/// setup (iOS 16.4, TrollStore install): SwiftUI's .fileImporter never
+/// presented at all, and the picker embedded as .sheet content opened but
+/// its Open button did nothing (an embedded picker's bar buttons rely on
+/// its own presentation). Presenting it the classic UIKit way is the route
+/// that works.
+final class FolderPickerPresenter: NSObject, UIDocumentPickerDelegate {
+    static let shared = FolderPickerPresenter()
+    private var onPick: ((URL) -> Void)?
 
-    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+    func present(onPick: @escaping (URL) -> Void) {
+        self.onPick = onPick
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
-        picker.delegate = context.coordinator
+        picker.delegate = self
         picker.allowsMultipleSelection = false
-        return picker
+        topViewController()?.present(picker, animated: true)
     }
 
-    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
-
-    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick, dismiss: dismiss) }
-
-    final class Coordinator: NSObject, UIDocumentPickerDelegate {
-        private let onPick: (URL) -> Void
-        private let dismiss: DismissAction
-        init(onPick: @escaping (URL) -> Void, dismiss: DismissAction) {
-            self.onPick = onPick
-            self.dismiss = dismiss
-        }
-        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            if let url = urls.first { onPick(url) }
-            dismiss()
-        }
-        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { dismiss() }
+    private func topViewController() -> UIViewController? {
+        let scene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+            ?? UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        var top = scene?.windows.first { $0.isKeyWindow }?.rootViewController
+        while let presented = top?.presentedViewController { top = presented }
+        return top
     }
+
+    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        if let url = urls.first { onPick?(url) }
+        onPick = nil
+    }
+
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { onPick = nil }
 }
 
 struct SettingsView: View {
@@ -1004,7 +1006,6 @@ struct SettingsView: View {
     @State private var notesKeyDraft = ""
     @State private var notesChatModel = AISettings.notesChatModel
     // Auto-save folder (item 3).
-    @State private var showFolderPicker = false
     var body: some View {
         Form {
             Section("AI Service (OpenAI-compatible)") {
@@ -1089,7 +1090,7 @@ struct SettingsView: View {
                 if FolderSettings.hasFolder {
                     Text("Saving to “\(FolderExporter.folderDisplayName)”")
                         .font(.footnote).foregroundStyle(Ink.secondary)
-                    Button("Choose a different folder") { showFolderPicker = true }
+                    Button("Choose a different folder") { pickFolder() }
                     Button("Stop auto-saving", role: .destructive) { model.exporter.forget() }
                 } else {
                     Text("After processing, the meeting's Markdown is written into a folder you pick — a notes vault, a synced folder, or anywhere in Files.")
@@ -1107,15 +1108,15 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
-        .sheet(isPresented: $showFolderPicker) {
-            // The picker grants access to the URL for this callback only;
-            // choose() turns it into a security-scoped bookmark, which is
-            // what persists the grant across launches. Presented through
-            // FolderPicker (UIKit) rather than .fileImporter: on this
-            // iOS 16.4 setup the SwiftUI importer silently never presented.
-            FolderPicker { url in model.exporter.choose(url) }
-        }
+
     }
+    /// Folder pick for auto-save: the picker grants access to the URL for
+    /// this callback only; choose() turns it into a security-scoped
+    /// bookmark, which is what persists the grant across launches.
+    private func pickFolder() {
+        FolderPickerPresenter.shared.present { url in model.exporter.choose(url) }
+    }
+
     private func saveKey() {
         let k = keyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !k.isEmpty else { return }
