@@ -1095,7 +1095,7 @@ struct SettingsView: View {
                 } else {
                     Text("After processing, the meeting's Markdown is written into a folder you pick — a notes vault, a synced folder, or anywhere in Files.")
                         .font(.footnote).foregroundStyle(Ink.secondary)
-                    Button("Choose folder…") { showFolderPicker = true }
+                    Button("Choose folder…") { pickFolder() }
                 }
             }
             Section("Privacy") {
