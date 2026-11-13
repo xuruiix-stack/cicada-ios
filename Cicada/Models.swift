@@ -134,8 +134,17 @@ enum TranscriptExport {
             if !n.actionItems.isEmpty { b += "### Action items\n\n"; for a in n.actionItems { b += "- [\(a.done ? "x" : " ")] \(a.text)\(a.owner.map { " (\($0))" } ?? "")\n" }; b += "\n" }
         }
         b += "## Transcript\n\n"
+        // Speaker labels, in step with the transcript rows: identified voices get
+        // their number, a line whose voice was never identified gets "Unknown"
+        // (upstream's 未识别) instead of claiming to be Speaker 1. Only when some
+        // voice IS on show — a solo recording keeps its plain S1.
+        let numbers = SpeakerLabels.voiceNumbers(s.lines)
         for l in s.lines {
-            let who = l.speakerName ?? "Speaker \(l.speaker)"
+            let who: String
+            if let name = l.speakerName { who = name }
+            else if let v = l.voice, let n = numbers[v] { who = "Speaker \(n)" }
+            else if numbers.isEmpty { who = "Speaker \(l.speaker)" }
+            else { who = "Unknown" }
             b += "**[\(clock(l.t))] \(who)**  \n\(l.src)\n"
             if let d = l.dst, d != l.src { b += "> \(d)\n" }
             b += "\n"
