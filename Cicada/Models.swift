@@ -81,6 +81,11 @@ struct Session: Identifiable, Codable, Equatable {
     /// Chunks that failed transcription even after their retry (Ling path).
     var failedChunkCount = 0
     var duration: Double { endedAt.map { $0.timeIntervalSince(startedAt) } ?? 0 }
+    /// The folder-export contract's `source` field is "file" only for imported
+    /// files; this build records only meetings, so it stays nil (→ "meeting")
+    /// until import exists. Computed, not persisted: session JSON schema is
+    /// unchanged this round.
+    var sourceFile: String? { nil }
 }
 
 extension Session {
