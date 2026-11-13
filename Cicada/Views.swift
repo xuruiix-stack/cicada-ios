@@ -85,6 +85,14 @@ final class AppModel: ObservableObject {
         store.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &subs)
+        // Recording errors (disk full, write failure) are set on Recorder.error
+        // from tap/interruption contexts that have no UI of their own; surface
+        // them as the app-level alert. objectWillChange fires before the change
+        // lands, so read the value on the next run-loop turn.
+        recorder.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.surfaceRecorderError() }
+            .store(in: &subs)
         // Speaker separation: the recorder's voice gate closes segments while the
         // recording runs; embed each one's audio as it arrives (voiceSegmentArrived),
         // so stop-time work is only the grouping. objectWillChange fires before the
@@ -102,6 +110,21 @@ final class AppModel: ObservableObject {
             store.sessions[i].lastError = "Processing was interrupted before it finished."
             store.save(store.sessions[i])
         }
+        // Killed mid-recording (upstream SessionStore.load's rule): a session
+        // with audio but no endedAt was recording when the app was terminated
+        // (iOS reclaimed the background app, or a crash) — Stop never ran, so
+        // its JSON never got an end. Without this pass it would show as
+        // "0 min · 0 lines" and look lost, while its audio is safe in
+        // Recordings. Finalize it with the real duration from the audio file.
+        for i in store.sessions.indices where store.sessions[i].endedAt == nil {
+            guard let url = store.audioURL(for: store.sessions[i]),
+                  FileManager.default.fileExists(atPath: url.path) else { continue }
+            let seconds = Recorder.audioSeconds(at: url)
+            guard seconds > 0 else { continue }
+            store.sessions[i].endedAt = store.sessions[i].startedAt.addingTimeInterval(seconds)
+            store.save(store.sessions[i])
+            debugLog("recovered session \(store.sessions[i].id) killed mid-recording: \(Int(seconds)) s of audio")
+        }
         // Interruption handling (upstream RoomListen): when the audio cannot be
         // taken back after a call/Siri/route change, the recorder tells us here
         // and the session is finalized truthfully — the UI stops claiming
@@ -117,6 +140,24 @@ final class AppModel: ObservableObject {
             self?.recorder.appBecameActive()
         }
         startNetworkMonitor()
+    }
+
+    /// The recording error surfaced by the last pass (surfaceRecorderError), so
+    /// a value still on Recorder.error is not re-alerted on every change.
+    private var surfacedRecorderError: String?
+
+    /// Show Recorder.error as the app-level message, once per value: the tap
+    /// write-failure path (disk full) and recordingLost set it from contexts
+    /// that cannot present anything themselves. onRecordingLost already calls
+    /// stopRecording() for the unrecoverable cases; this makes the reason
+    /// visible either way.
+    private func surfaceRecorderError() {
+        // The error cleared (a new recording started): arm the dedup again so
+        // the same failure text in a later recording still alerts.
+        guard let e = recorder.error else { surfacedRecorderError = nil; return }
+        guard e != surfacedRecorderError else { return }
+        surfacedRecorderError = e
+        message = e
     }
 
     // MARK: - Network recovery: auto-retry cloud transcription when signal returns

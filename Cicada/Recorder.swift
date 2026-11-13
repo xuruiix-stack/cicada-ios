@@ -123,6 +123,8 @@ final class Recorder: NSObject, ObservableObject {
             throw error
         }
         startedAt = Date(); isRecording = true
+        error = nil   // a new recording starts with a clean slate; AppModel shows the last one
+        debugLog("recorder: started")
         // Schedule on the main run loop explicitly: start() can resume off-main after
         // the permission continuation, and a timer on a background run loop never fires.
         let t = Timer(timeInterval: 0.2, repeats: true) { _ in
@@ -431,9 +433,20 @@ final class Recorder: NSObject, ObservableObject {
         closeLockedSegment()
         gateLock.unlock()
         isRecording = false; level = 0; paused = false
+        debugLog("recorder: stopped after \(Int(Date().timeIntervalSince(startedAt))) s")
         let url = file?.url
         file = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         return url
+    }
+
+    /// The length of a recording's audio file, in seconds. Killed-recording
+    /// recovery (AppModel at launch): the real duration of a session whose
+    /// Stop never ran, derived from the file the recorder kept writing to
+    /// (upstream SessionStore.load's partial-recording rule). 0 when the file
+    /// is missing or unreadable.
+    static func audioSeconds(at url: URL) -> Double {
+        guard let f = try? AVAudioFile(forReading: url) else { return 0 }
+        return Double(f.length) / f.processingFormat.sampleRate
     }
 }
