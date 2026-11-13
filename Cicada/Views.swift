@@ -956,6 +956,41 @@ struct NotesView: View {
 
 // MARK: - Settings
 
+/// Folder picking through UIKit's document picker in a sheet: SwiftUI's
+/// .fileImporter failed to present at all on the target setup (iOS 16.4,
+/// TrollStore install), so the pick goes through UIDocumentPickerViewController
+/// directly — the same system UI and the same security-scoped URL, one less
+/// presentation layer in between.
+struct FolderPicker: UIViewControllerRepresentable {
+    var onPick: (URL) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
+        picker.delegate = context.coordinator
+        picker.allowsMultipleSelection = false
+        return picker
+    }
+
+    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick, dismiss: dismiss) }
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        private let onPick: (URL) -> Void
+        private let dismiss: DismissAction
+        init(onPick: @escaping (URL) -> Void, dismiss: DismissAction) {
+            self.onPick = onPick
+            self.dismiss = dismiss
+        }
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            if let url = urls.first { onPick(url) }
+            dismiss()
+        }
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { dismiss() }
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
     @State private var baseURL = AISettings.baseURL
@@ -1072,11 +1107,13 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
-        .fileImporter(isPresented: $showFolderPicker, allowedContentTypes: [.folder]) { result in
+        .sheet(isPresented: $showFolderPicker) {
             // The picker grants access to the URL for this callback only;
             // choose() turns it into a security-scoped bookmark, which is
-            // what persists the grant across launches.
-            if case .success(let url) = result { model.exporter.choose(url) }
+            // what persists the grant across launches. Presented through
+            // FolderPicker (UIKit) rather than .fileImporter: on this
+            // iOS 16.4 setup the SwiftUI importer silently never presented.
+            FolderPicker { url in model.exporter.choose(url) }
         }
     }
     private func saveKey() {
