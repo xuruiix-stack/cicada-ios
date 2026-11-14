@@ -131,6 +131,10 @@ final class AppModel: ObservableObject {
         // its JSON never got an end. Without this pass it would show as
         // "0 min · 0 lines" and look lost, while its audio is safe in
         // Recordings. Finalize it with the real duration from the audio file.
+        // The recorder now writes crash-safe CAF (Recorder.start), so the file
+        // a kill leaves behind IS readable up to the last flushed write; the
+        // old .m4a sink often was not (unfinalized MP4 container), which is
+        // why recovered sessions used to show 0 and refuse to play.
         for i in store.sessions.indices where store.sessions[i].endedAt == nil {
             guard let url = store.audioURL(for: store.sessions[i]),
                   FileManager.default.fileExists(atPath: url.path) else { continue }
@@ -140,6 +144,23 @@ final class AppModel: ObservableObject {
             store.save(store.sessions[i])
             debugLog("recovered session \(store.sessions[i].id) killed mid-recording: \(Int(seconds)) s of audio")
         }
+        // A recovered session whose audio is unreadable (a pre-CAF .m4a the kill
+        // left unfinalized — the 2026-11-14 field report's exact case — or a lost
+        // file) must say so honestly instead of showing as an empty record the
+        // user cannot tell from silence: the file exists but its duration reads
+        // 0, so nothing can be played or transcribed from it. processingState
+        // .failed is what makes the Notes tab render lastError at all.
+        for i in store.sessions.indices where store.sessions[i].endedAt == nil {
+            guard store.sessions[i].audioFile != nil else { continue }
+            guard let url = store.audioURL(for: store.sessions[i]),
+                  FileManager.default.fileExists(atPath: url.path),
+                  Recorder.audioSeconds(at: url) <= 0 else { continue }
+            store.sessions[i].endedAt = store.sessions[i].startedAt
+            store.sessions[i].processingState = .failed
+            store.sessions[i].lastError = "This recording's audio file is damaged (the app was terminated while it was being written, before the crash-safe format). It cannot be played or transcribed."
+            store.save(store.sessions[i])
+            debugLog("recovered session \(store.sessions[i].id) has unreadable audio; marked honestly")
+        }
         // Interruption handling (upstream RoomListen): when the audio cannot be
         // taken back after a call/Siri/route change, the recorder tells us here
         // and the session is finalized truthfully — the UI stops claiming
@@ -147,6 +168,16 @@ final class AppModel: ObservableObject {
         recorder.onRecordingLost = { [weak self] _ in
             self?.stopRecording()
         }
+        // Recovered sessions (the killed-mid-recording pass above) must be
+        // transcribable without a delete/re-record: the auto-retry on reconnect
+        // keys on `endedAt != nil && audioFile != nil && !transcribed`, both of
+        // which the pass now sets — but its `guard recordingId == nil` and the
+        // `AISettings.isConfigured` check run at init time, when the network
+        // monitor has not settled yet. Nothing blocks the manual ↻ in the detail
+        // screen (it calls process() directly), and the network monitor's first
+        // offline→online transition retries these as soon as the service is set
+        // up — no change needed there, this note is the audit trail.
+        //
         // Folder export problems (stale bookmark, write error) arrive after the
         // pipeline is done; show them as the app alert, once per failure text.
         exporter.onSurface = { [weak self] text in
@@ -278,9 +309,16 @@ final class AppModel: ObservableObject {
             message = "Microphone / speech permission denied. Enable the microphone in Settings › Privacy › Microphone."
             return
         }
+        // Speaker separation: compile/load the voiceprint model before the engine
+        // starts, not on the first voice segment mid-recording (review-1 P1-2: the
+        // first-segment compile was a background memory spike feeding jetsam).
+        speakers.warmUp()
         var s = Session(); s.startedAt = Date()
+        // .caf, not .m4a: the recorder's crash-safe sink (see Recorder.start).
+        // The extension is what recovery (audioURL), playback (AVAudioPlayer) and
+        // the upload mime all key off, so it must match the format actually written.
         let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("Cicada/Recordings/\(s.id).m4a")
+            .appendingPathComponent("Cicada/Recordings/\(s.id).caf")
         s.audioFile = url.lastPathComponent
         do {
             try recorder.start(audioURL: url)

@@ -257,6 +257,25 @@ final class SpeakerTagger {
     /// A new recording: forget the model's load failure only (the clusterer is the caller's).
     func reset() { queue.async { [self] in loadFailed = false }; available = true }
 
+    /// Load/compile the model NOW, off the recording's hot path (review-1 P1-2:
+    /// the first voice segment used to trigger MLModel.compileModel mid-recording —
+    /// a heavy CPU/memory spike exactly when the app may already be in the
+    /// background, prime jetsam territory). Called when the user taps Record
+    /// (the app is foreground and idle): the ~13 MB model compiles/loads once
+    /// here, and the first segment's embed becomes a plain inference. Failure
+    /// is fine — embed() retries the load and degrades gracefully as before.
+    func warmUp() {
+        queue.async { [self] in
+            if model == nil, !loadFailed {
+                do { model = try Voiceprints.load() }
+                catch {
+                    loadFailed = true
+                    debugLog("voiceprint model failed to load: \(error)")
+                }
+            }
+        }
+    }
+
     /// `done` with the unit-length voiceprint, or nil when the audio is too short or the
     /// model failed to load (the caller then leaves the line unlabelled — upstream ab787d4:
     /// no voice yet is not "like no voice", so a pending or failed voiceprint never
