@@ -303,7 +303,7 @@ final class AIClient: ObservableObject {
             throw AIError.invalidResponse(host: nil) }
         let dst = FileManager.default.temporaryDirectory
             .appendingPathComponent("cicada-upload-\(UUID().uuidString).wav")
-        let wavSettings: [String: Any] = [AVFormatIDKey: kAudioFormatWAVE, AVSampleRateKey: CicadaTuning.sampleRate,
+        let wavSettings: [String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: CicadaTuning.sampleRate,
             AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
             AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false]
         let w = try AVAudioFile(forWriting: dst, settings: wavSettings)

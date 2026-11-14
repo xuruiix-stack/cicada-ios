@@ -108,7 +108,7 @@ final class Recorder: NSObject, ObservableObject {
             // The pipeline converts to WAV before upload (AIClient.wavCopy);
             // CAF itself never leaves the device.
             file = try AVAudioFile(forWriting: audioURL, settings: [
-                AVFormatIDKey: kAudioFormatCAF, AVSampleRateKey: CicadaTuning.sampleRate,
+                AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: CicadaTuning.sampleRate,
                 AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16,
                 AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false,
                 AVLinearPCMIsNonInterleaved: false])
