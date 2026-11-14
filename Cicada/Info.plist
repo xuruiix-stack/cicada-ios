@@ -10,7 +10,7 @@
 	<key>CFBundleName</key><string>Cicada</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleShortVersionString</key><string>1.1.0</string>
-	<key>CFBundleVersion</key><string>5</string>
+	<key>CFBundleVersion</key><string>6</string>
 	<key>LSRequiresIPhoneOS</key><true/>
 	<key>NSMicrophoneUsageDescription</key><string>Cicada records the room to transcribe, translate and write meeting notes.</string>
 	<key>NSSpeechRecognitionUsageDescription</key><string>Cicada turns spoken words into text on this device.</string>
