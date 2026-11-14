@@ -1,6 +1,7 @@
 import AVFoundation
 import Speech
 import Foundation
+import os
 
 /// One VAD segment (segmenter.py's gate): the audio between a voice starting and a pause
 /// ending it. `samples` are the segment's 16 kHz mono audio for the voiceprint engine;
@@ -11,8 +12,9 @@ struct VoiceSegment {
 }
 
 /// Segmenter gate (segmenter.py): threshold 0.01, pause 0.6 s, max 8 s, pre-roll 0.15 s.
-/// Microphone recording (AVAudioEngine → AAC .m4a) with live level, plus on-device
-/// speech recognition (SFSpeechRecognizer) for live captions when no AI key is set.
+/// Microphone recording (AVAudioEngine → CAF LinearPCM — crash-safe, see start())
+/// with live level, plus on-device speech recognition (SFSpeechRecognizer) for
+/// live captions when no AI key is set.
 /// While recording, the same 16 kHz stream feeds a voice gate: each voiced segment's
 /// audio is collected for the voiceprint engine (SpeakerID.swift).
 final class Recorder: NSObject, ObservableObject {
@@ -91,8 +93,25 @@ final class Recorder: NSObject, ObservableObject {
         try session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker])
         do {
             try session.setActive(true)
+            // Crash-safe sink (2026-11-14 field report): the recorder used to write
+            // AAC .m4a, whose MP4 container is only finalized by ExtAudioFile's
+            // teardown. When iOS jetsam-killed the app in the background mid-recording,
+            // the file was left without its moov atom — AVAudioFile, AVAudioPlayer and
+            // the transcription's converter all failed on it, so every kill was a
+            // TOTAL loss (recovered session: 0 duration, unplayable, untranscribable).
+            // CAF with 16-bit LinearPCM has no trailing container structures: the
+            // header is written up front and each PCM packet lands sequentially, so
+            // a file abandoned at any frame is readable up to the last flushed write.
+            // Cost, stated honestly: 16 kHz mono 16-bit PCM ≈ 1.9 MB/min (AAC was
+            // ~0.2-0.5 MB/min) — a 2-hour meeting is ~230 MB. The sink is already
+            // 16 kHz mono (the voiceprint/ASR formats), so quality is identical.
+            // The pipeline converts to WAV before upload (AIClient.wavCopy);
+            // CAF itself never leaves the device.
             file = try AVAudioFile(forWriting: audioURL, settings: [
-                AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: CicadaTuning.sampleRate, AVNumberOfChannelsKey: 1])
+                AVFormatIDKey: kAudioFormatCAF, AVSampleRateKey: CicadaTuning.sampleRate,
+                AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsNonInterleaved: false])
         }
         catch {
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
@@ -123,6 +142,7 @@ final class Recorder: NSObject, ObservableObject {
             throw error
         }
         startedAt = Date(); isRecording = true
+        lastFootprintLog = Date()
         error = nil   // a new recording starts with a clean slate; AppModel shows the last one
         debugLog("recorder: started")
         // Schedule on the main run loop explicitly: start() can resume off-main after
@@ -210,6 +230,15 @@ final class Recorder: NSObject, ObservableObject {
             center.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) {
                 [weak self] _ in self?.routeChanged()
             },
+            // The whole media server died (user rebooted the audio daemon, or a
+            // system audio crash). Round 1 covered interruptions and route
+            // changes; this one invalidates everything — the engine is dead, the
+            // session is reset, and without handling it the app sits with
+            // isRecording true while nothing feeds the file, which is exactly
+            // the stall-then-suspend chain that gets the app killed.
+            center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: session, queue: .main) {
+                [weak self] _ in self?.mediaServicesReset()
+            },
         ]
     }
 
@@ -257,6 +286,42 @@ final class Recorder: NSObject, ObservableObject {
         catch {
             debugLog("recorder: restart after route change failed: \(error.localizedDescription)")
             recordingLost("The audio route changed and the microphone could not be recovered, so the recording was stopped.")
+        }
+    }
+
+    /// The media server was reset while recording: the engine object is now
+    /// invalid (its underlying units point at a dead server) and the session
+    /// lost its category/activation. Rebuild both from scratch and re-tap; the
+    /// CAF file keeps its format, so the recording continues into the same
+    /// file as if nothing had happened. If the rebuild fails, finalize honestly
+    /// through the existing onRecordingLost path instead of stalling.
+    private func mediaServicesReset() {
+        guard isRecording else { return }
+        debugLog("recorder: media services were reset, rebuilding engine")
+        engine?.inputNode.removeTap(onBus: 0)
+        engine?.stop()
+        engine = nil
+        converter = nil
+        held = false
+        paused = true
+        do {
+            let newEngine = AVAudioEngine()
+            try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker])
+            try AVAudioSession.sharedInstance().setActive(true)
+            engine = newEngine
+            // Re-attach the configuration-change observer to the NEW engine (the
+            // old one's observer watched a dead object) and track it in `observers`
+            // so stop() removes it with the rest.
+            let center = NotificationCenter.default
+            let token = center.addObserver(forName: .AVAudioEngineConfigurationChange, object: newEngine, queue: .main) {
+                [weak self] _ in self?.routeChanged()
+            }
+            observers.append(token)
+            try tapAndStart(engine: newEngine)
+            paused = false
+        } catch {
+            debugLog("recorder: rebuild after media reset failed: \(error.localizedDescription)")
+            recordingLost("The device's audio services restarted and the microphone could not be recovered, so the recording was stopped. The audio up to that point is saved.")
         }
     }
 
@@ -343,6 +408,12 @@ final class Recorder: NSObject, ObservableObject {
     }
 
     /// One tap buffer → converted 16 kHz buffers → file, level, live captions and the voice gate.
+    /// Per-tap buffer allocation is bounded churn, not growth (each is freed when
+    /// the callback returns); reusing one buffer across taps was considered and
+    /// rejected: SFSpeechAudioBufferRecognitionRequest.append's copy/retain
+    /// semantics are not documented for iOS 16, and a retained buffer rewritten
+    /// by the next tap would corrupt the live captions. Recording integrity
+    /// first — the malloc is cheap, the risk was not.
     private func handle(_ buffer: AVAudioPCMBuffer) {
         guard let file, let converter else { return }
         let ratio = sinkFormat.sampleRate / buffer.format.sampleRate
@@ -365,7 +436,28 @@ final class Recorder: NSObject, ObservableObject {
             gate(ch, frames: Int(cap.frameLength))
         }
         request?.append(cap)
+        // Flush discipline, stated honestly: AVAudioFile offers no explicit
+        // flush API, and none is needed for this sink — each write(from:) goes
+        // through ExtAudioFile's convert-then-write, and for LinearPCM CAF the
+        // packets reach the kernel's page cache on every call (no trailing
+        // container structures are held back for finalize, unlike MP4/AAC).
+        // A jetsam kill (SIGKILL) cannot lose page-cache data, so the file is
+        // readable up to the last tap buffer that completed — a sub-second
+        // loss window at most. Only device power loss could take more, which
+        // no app-level flushing can prevent.
+        // Footprint trail (review-1 P1-2): if the process is jetsam-killed in the
+        // background, the last log lines must show whether memory was climbing.
+        // One line per ~30 s: elapsed and the remaining memory headroom via
+        // os_proc_available_memory (what jetsam compares against its limit).
+        // No transcript content.
+        if Date().timeIntervalSince(lastFootprintLog) >= 30 {
+            lastFootprintLog = Date()
+            let elapsed = Date().timeIntervalSince(startedAt)
+            let headroom = os_proc_available_memory()
+            debugLog(String(format: "recorder: %ld s elapsed, %ld KB memory headroom", Int(elapsed), Int(headroom / 1024)))
+        }
     }
+    private var lastFootprintLog = Date()
 
     /// The voice gate (segmenter.py): a chunk louder than the threshold opens a segment, a pause
     /// of `pauseEndsSegment` closes it, and a segment runs at most `maxSegmentLength`. Runs on the

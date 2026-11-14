@@ -3,7 +3,8 @@ import SwiftUI
 import Foundation
 
 /// Plays a finished session's recording (the official iOS app's RecordPlayer
-/// is the model): AVAudioPlayer over the .m4a in Documents/Cicada/Recordings,
+/// is the model): AVAudioPlayer over the .caf (crash-safe LinearPCM; older
+/// sessions are .m4a — AVAudioPlayer reads both) in Documents/Cicada/Recordings,
 /// a 0.25 s timer drives the playhead the transcript highlights, and the
 /// transcript's line times seek. Owned by the record detail screen; its life
 /// is the screen's — stop() runs on leaving, so no player outlives its page.

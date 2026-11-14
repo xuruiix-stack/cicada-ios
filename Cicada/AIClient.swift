@@ -95,7 +95,7 @@ enum Keychain {
 
 enum AIError: LocalizedError {
     case notConfigured
-    /// nil host = not a service reply at all (the local .m4a→wav conversion
+    /// nil host = not a service reply at all (the local recording→wav conversion
     /// could not read the recording's format); otherwise the host that
     /// answered with something unusable.
     case invalidResponse(host: String?)
@@ -276,15 +276,69 @@ final class AIClient: ObservableObject {
             let r = try await transcribeChunked(audioURL: audioURL, language: language)
             return r.text
         }
-        return try await transcribeFile(audioURL, model: transcribeModelForProvider, language: language)
+        // The crash-safe sink writes .caf (Recorder.start); OpenAI-compatible
+        // /audio/transcriptions endpoints document flac/m4a/mp3/mp4/wav/webm —
+        // CAF is NOT among them, so a .caf upload would 400 on most providers.
+        // Convert to .wav (the same 16 kHz mono PCM, in a container they take)
+        // before uploading. Older .m4a sessions upload unchanged, as before.
+        // The tmp copy is deleted whether the upload succeeds or throws.
+        var uploadURL = audioURL
+        if audioURL.pathExtension.lowercased() == "caf" {
+            uploadURL = try wavCopy(of: audioURL)
+        }
+        defer {
+            if uploadURL != audioURL { try? FileManager.default.removeItem(at: uploadURL) }
+        }
+        return try await transcribeFile(uploadURL, model: transcribeModelForProvider, language: language)
+    }
+
+    /// A whole-file 16 kHz mono LinearPCM .wav copy of the recording, in tmp,
+    /// for providers that do not accept CAF. The caller's defer deletes it;
+    /// a throw before that leaks at most one tmp file per failed transcription,
+    /// and tmp is purged by the system.
+    private func wavCopy(of audioURL: URL) throws -> URL {
+        let src = try AVAudioFile(forReading: audioURL)
+        guard let out = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                      sampleRate: CicadaTuning.sampleRate, channels: 1, interleaved: false) else {
+            throw AIError.invalidResponse(host: nil) }
+        let dst = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cicada-upload-\(UUID().uuidString).wav")
+        let wavSettings: [String: Any] = [AVFormatIDKey: kAudioFormatWAVE, AVSampleRateKey: CicadaTuning.sampleRate,
+            AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false]
+        let w = try AVAudioFile(forWriting: dst, settings: wavSettings)
+        let conv = src.processingFormat == out ? nil
+            : AVAudioConverter(from: src.processingFormat, to: out)
+        let readCap = AVAudioFrameCount(16384)
+        while src.framePosition < src.length {
+            guard let inBuf = AVAudioPCMBuffer(pcmFormat: src.processingFormat, frameCapacity: readCap) else { break }
+            try src.read(into: inBuf)
+            guard inBuf.frameLength > 0 else { break }
+            var converted = inBuf
+            if let conv {
+                let ratio = out.sampleRate / src.processingFormat.sampleRate
+                let cap = AVAudioFrameCount((Double(inBuf.frameLength) * ratio).rounded(.up)) + 32
+                guard let outBuf = AVAudioPCMBuffer(pcmFormat: out, frameCapacity: cap) else { break }
+                var fed = false; var cerr: NSError?
+                conv.convert(to: outBuf, error: &cerr) { _, status in
+                    if fed { status.pointee = .noDataNow; return nil }
+                    fed = true; status.pointee = .haveData
+                    return inBuf
+                }
+                guard fed, cerr == nil, outBuf.frameLength > 0 else { break }
+                converted = outBuf
+            }
+            try w.write(from: converted)
+        }
+        return dst
     }
 
     /// Chunked Ling path with per-chunk fault tolerance. Chunks that fail
     /// twice are skipped and counted, not thrown.
     func transcribeChunked(audioURL: URL, language: String? = nil) async throws -> ChunkedTranscription {
         // Ling (api.ant-ling.com) /v1/audio/transcriptions accepts ONLY model
-        // Ming-3.0-asr-tiny, ONLY .wav (not .m4a), ≤10 MB and ≤30 s per call.
-        // Convert the recorded .m4a to 16 kHz mono LinearPCM .wav on device,
+        // Ming-3.0-asr-tiny, ONLY .wav (not .m4a/.caf), ≤10 MB and ≤30 s per call.
+        // Convert the recording to 16 kHz mono LinearPCM .wav on device,
         // split into ≤30 s chunks, transcribe each, join the texts.
         let chunks = try lingWavChunks(from: audioURL)
         defer {
@@ -346,7 +400,11 @@ final class AIClient: ObservableObject {
         field("model", model); field("response_format", "json")
         if let language { field("language", language) }
         let file = try Data(contentsOf: fileURL)
-        let mime = fileURL.pathExtension.lowercased() == "wav" ? "audio/wav" : "audio/m4a"
+        // The recorder now writes .caf (crash-safe LinearPCM); older sessions and
+        // the Ling path's temp chunks are .m4a/.wav. Map by extension so every
+        // sink this build has ever produced uploads with a truthful mime type.
+        let ext = fileURL.pathExtension.lowercased()
+        let mime = ext == "wav" ? "audio/wav" : ext == "caf" ? "audio/x-caf" : "audio/m4a"
         body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"\(fileURL.lastPathComponent)\"\r\nContent-Type: \(mime)\r\n\r\n".data(using: .utf8)!)
         body.append(file); body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
         r.httpBody = body
@@ -361,8 +419,9 @@ final class AIClient: ObservableObject {
         return text
     }
 
-    /// .m4a → 16 kHz mono LinearPCM .wav chunk files of ≤30 s each (Ling's limits),
-    /// via AVAudioFile read + write and AVAudioConverter when rates differ — the
+    /// The recording (.caf since the crash-safe sink; .m4a for older sessions) →
+    /// 16 kHz mono LinearPCM .wav chunk files of ≤30 s each (Ling's limits), via
+    /// AVAudioFile read + write and AVAudioConverter when rates differ — the
     /// same AVFoundation APIs Recorder.swift already uses. Caller deletes the files.
     private func lingWavChunks(from audioURL: URL) throws -> [URL] {
         let src = try AVAudioFile(forReading: audioURL)
