@@ -465,7 +465,6 @@ final class AppModel: ObservableObject {
             let seconds = Double(seg.samplesFrames) / CicadaTuning.sampleRate
             voices.append(seg.emb.flatMap { clusterer.label($0, seconds: seconds) })
         }
-        let hasCumulativeFallback = cumulativeFallbackSessions.remove(s.id) != nil
         if !session.lines.isEmpty && !hasCumulativeFallback {
             // Keep live text intact and attach embeddings only when live lines
             // correspond closely to individual segments. A cumulative on-device
