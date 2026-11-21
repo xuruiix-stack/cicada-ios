@@ -49,12 +49,15 @@ final class SessionStore: ObservableObject {
     @Published var sessions: [Session] = []
     private let dir: URL
     private let audioDir: URL
+    private let importsDir: URL
 
     init() {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         dir = docs.appendingPathComponent("Cicada", isDirectory: true)
         audioDir = dir.appendingPathComponent("Recordings", isDirectory: true)
+        importsDir = dir.appendingPathComponent("Imports", isDirectory: true)
         try? FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: importsDir, withIntermediateDirectories: true)
         load()
     }
 
@@ -78,8 +81,17 @@ final class SessionStore: ObservableObject {
         sessions.removeAll { $0.id == s.id }
         try? FileManager.default.removeItem(at: dir.appendingPathComponent("\(s.id).json"))
         if let f = s.audioFile { try? FileManager.default.removeItem(at: audioDir.appendingPathComponent(f)) }
+        if let f = s.importSourceFile { try? FileManager.default.removeItem(at: importsDir.appendingPathComponent(f)) }
     }
     func audioURL(for s: Session) -> URL? { s.audioFile.map { audioDir.appendingPathComponent($0) } }
+    func importURL(for s: Session) -> URL? { s.importSourceFile.map { importsDir.appendingPathComponent($0) } }
+    func recordingURL(for id: String) -> URL { audioDir.appendingPathComponent("\(id).caf") }
+    func importedSourceURL(for id: String, filename: String) -> URL {
+        let rawExtension = (filename as NSString).pathExtension.lowercased()
+        let ext = String(String.UnicodeScalarView(rawExtension.unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) }.prefix(12)))
+        return importsDir.appendingPathComponent("\(id)-source.\(ext.isEmpty ? "media" : ext)")
+    }
 
     /// Re-transcription is explicitly destructive only after a complete new transcript
     /// arrives. Keep the old record (including names/notes) outside load()'s JSON folder.

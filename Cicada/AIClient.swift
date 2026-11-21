@@ -248,7 +248,10 @@ final class AIClient: ObservableObject {
         r.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp): (Data, URLResponse)
         do { (data, resp) = try await URLSession.shared.data(for: r) }
-        catch { throw AIError.unreachable(host: url.host ?? url.absoluteString, error) }
+        catch {
+            if Task.isCancelled { throw CancellationError() }
+            throw AIError.unreachable(host: url.host ?? url.absoluteString, error)
+        }
         guard let h = resp as? HTTPURLResponse, h.statusCode == 200 else {
             throw throwHTTP(resp, body: data, host: url.host ?? "") }
         guard let j = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -312,6 +315,7 @@ final class AIClient: ObservableObject {
             : AVAudioConverter(from: src.processingFormat, to: out)
         let readCap = AVAudioFrameCount(16384)
         while src.framePosition < src.length {
+            try Task.checkCancellation()
             guard let inBuf = AVAudioPCMBuffer(pcmFormat: src.processingFormat, frameCapacity: readCap) else { break }
             try src.read(into: inBuf)
             guard inBuf.frameLength > 0 else { break }
@@ -351,16 +355,25 @@ final class AIClient: ObservableObject {
         var texts: [String] = []
         var failedChunks = 0
         for c in chunks {
+            try Task.checkCancellation()
             do {
                 let t = try await transcribeFile(c, model: lingTranscribeModel, language: language)
+                try Task.checkCancellation()
                 if !t.isEmpty { texts.append(t) }
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
+                if Task.isCancelled { throw CancellationError() }
                 // Retry once — transient network/server hiccups are the common
                 // case on a 4+ minute recording's 8+ sequential chunk calls.
                 do {
                     let t = try await transcribeFile(c, model: lingTranscribeModel, language: language)
+                    try Task.checkCancellation()
                     if !t.isEmpty { texts.append(t) }
+                } catch is CancellationError {
+                    throw CancellationError()
                 } catch {
+                    if Task.isCancelled { throw CancellationError() }
                     failedChunks += 1
                 }
             }
@@ -411,7 +424,10 @@ final class AIClient: ObservableObject {
         r.httpBody = body
         let (data, resp): (Data, URLResponse)
         do { (data, resp) = try await URLSession.shared.data(for: r) }
-        catch { throw AIError.unreachable(host: url.host ?? url.absoluteString, error) }
+        catch {
+            if Task.isCancelled { throw CancellationError() }
+            throw AIError.unreachable(host: url.host ?? url.absoluteString, error)
+        }
         guard let h = resp as? HTTPURLResponse, h.statusCode == 200 else {
             throw throwHTTP(resp, body: data, host: url.host ?? "") }
         guard let j = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -460,6 +476,7 @@ final class AIClient: ObservableObject {
         let chunkFrames = Int(CicadaTuning.sampleRate * lingChunkSeconds)
         let readCap = AVAudioFrameCount(16384)
         while src.framePosition < src.length {
+            try Task.checkCancellation()
             guard let inBuf = AVAudioPCMBuffer(pcmFormat: src.processingFormat, frameCapacity: readCap) else { break }
             try src.read(into: inBuf)
             guard inBuf.frameLength > 0 else { break }
@@ -498,6 +515,54 @@ final class AIClient: ObservableObject {
         // An empty result (zero-length audio) leaves the temp dir to the defer.
         completed = !chunks.isEmpty
         return chunks
+    }
+
+    /// Transcribe one live VAD segment without retaining its samples after the
+    /// request. The recorder's segments are already 16 kHz mono; writing a small
+    /// WAV lets the live path reuse the same provider-aware ASR and Ling chunking
+    /// as the finished-recording path.
+    func transcribeLive(samples: [Float]) async throws -> String {
+        guard !samples.isEmpty else { return "" }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cicada-live-\(UUID().uuidString).wav")
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: CicadaTuning.sampleRate,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+        guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                         sampleRate: CicadaTuning.sampleRate,
+                                         channels: 1, interleaved: false),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format,
+                                             frameCapacity: AVAudioFrameCount(samples.count)) else {
+            throw AIError.invalidResponse(host: nil)
+        }
+        buffer.frameLength = AVAudioFrameCount(samples.count)
+        if let dst = buffer.floatChannelData?[0] {
+            samples.withUnsafeBufferPointer { src in
+                guard let base = src.baseAddress else { return }
+                dst.update(from: base, count: samples.count)
+            }
+        }
+        do {
+            // Release the writer before any reader/upload opens the WAV header.
+            try writeLiveBuffer(buffer, to: url, settings: settings)
+            defer { try? FileManager.default.removeItem(at: url) }
+            try Task.checkCancellation()
+            return try await transcribe(audioURL: url)
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
+    }
+
+    private func writeLiveBuffer(_ buffer: AVAudioPCMBuffer, to url: URL, settings: [String: Any]) throws {
+        let file = try AVAudioFile(forWriting: url, settings: settings)
+        try file.write(from: buffer)
     }
 
     func translate(_ text: String, to lang: String) async throws -> String {

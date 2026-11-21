@@ -20,6 +20,12 @@ final class AppModel: ObservableObject {
     @Published var selection: String?
     @Published var busy = false
     @Published var message: String?
+    @Published var liveMeeting = LiveMeetingCoordinator()
+    @Published var showingLiveMeeting = false
+    @Published var showingFaceToFace = false
+    @Published private(set) var importingSessionID: String?
+    private var importCancellation: MediaImportCancellation?
+    private var importJobTask: Task<Void, Never>?
     enum Tab { case records, settings }
 
     var selected: Session? { store.sessions.first { $0.id == selection } }
@@ -29,7 +35,11 @@ final class AppModel: ObservableObject {
 
     /// Set by the background-task expiration handler: runPipeline checks it at
     /// each step boundary and saves the partial progress reached so far.
-    private var pipelineCancelled = false
+    private var pipelineStopRequested = false
+    private var pipelineCancelled: Bool {
+        get { pipelineStopRequested || Task.isCancelled || importCancellation?.isCancelled == true }
+        set { pipelineStopRequested = newValue }
+    }
     /// Active UIApplication background task for the pipeline, ended when it
     /// finishes (or left to the expiration handler if the app is torn down).
     private var backgroundTaskId: UIBackgroundTaskIdentifier = .invalid
@@ -57,6 +67,7 @@ final class AppModel: ObservableObject {
         var caption = ""
     }
     private var pendingSegs: [PendingSeg] = []
+    private var cumulativeFallbackCaptions: [String: String] = [:]
     /// `true` while the model is known missing/unloadable: skip the per-segment embedding
     /// work from then on (graceful degradation — every line keeps speaker 1).
     private var voiceprintsUnavailable = false
@@ -101,6 +112,9 @@ final class AppModel: ObservableObject {
         exporter.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &subs)
+        liveMeeting.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &subs)
         // Recording errors (disk full, write failure) are set on Recorder.error
         // from tap/interruption contexts that have no UI of their own; surface
         // them as the app-level alert. objectWillChange fires before the change
@@ -124,6 +138,15 @@ final class AppModel: ObservableObject {
         for i in store.sessions.indices where store.sessions[i].processingState == .running {
             store.sessions[i].processingState = .failed
             store.sessions[i].lastError = "Processing was interrupted before it finished."
+            if store.sessions[i].isImported && store.sessions[i].importState == .processing {
+                store.sessions[i].importState = .paused
+            }
+            store.save(store.sessions[i])
+        }
+        for i in store.sessions.indices where store.sessions[i].isImported &&
+            (store.sessions[i].importState == .extracting || store.sessions[i].importState == .queued) {
+            store.sessions[i].importState = .paused
+            store.sessions[i].lastError = "Import was interrupted. Resume to continue from the saved source file."
             store.save(store.sessions[i])
         }
         // Killed mid-recording (upstream SessionStore.load's rule): a session
@@ -263,7 +286,7 @@ final class AppModel: ObservableObject {
         // Mark them all up front: a later re-entrant call (the monitor can
         // fire more than once per window) must not double-book a session.
         let todo = store.sessions.filter {
-            $0.endedAt != nil && $0.audioFile != nil && !$0.transcribed && !autoRetriedIds.contains($0.id)
+            !$0.isImported && $0.endedAt != nil && $0.audioFile != nil && !$0.transcribed && !autoRetriedIds.contains($0.id)
         }
         guard !todo.isEmpty else { return }
         autoRetriedIds.formUnion(todo.map(\.id))
@@ -288,6 +311,14 @@ final class AppModel: ObservableObject {
     }
 
     private func voiceSegmentArrived(_ seg: VoiceSegment) {
+        // The live coordinator receives the same closed segment as the voiceprint
+        // path. It never owns the tap and has a small bounded queue, so recording
+        // remains safe if the service is slow or unavailable.
+        let start = max(0, seg.t - CicadaTuning.preRoll)
+        let end = seg.t + Double(seg.samples.count) / CicadaTuning.sampleRate + 0.4
+        let fallback = recorder.timedWords.filter { $0.mid >= start && $0.mid <= end }
+            .map(\.text).joined(separator: " ")
+        liveMeeting.append(seg, fallback: fallback, ai: ai)
         let id = UUID().uuidString
         var p = PendingSeg(id: id, t: seg.t, samplesFrames: seg.samples.count)
         guard !voiceprintsUnavailable else {
@@ -307,7 +338,7 @@ final class AppModel: ObservableObject {
     }
 
     func startRecording() async {
-        guard !busy, !pipelineActive, !startingRecording, recordingId == nil, !recorder.isRecording else { return }
+        guard importingSessionID == nil, !busy, !pipelineActive, !startingRecording, recordingId == nil, !recorder.isRecording else { return }
         startingRecording = true
         defer { startingRecording = false }
         message = nil
@@ -334,27 +365,44 @@ final class AppModel: ObservableObject {
             speakers.reset()
             pendingSegs = []
             voiceprintsUnavailable = false
-            // No navigation here: the user stays on the list, where Stop and the
-            // live elapsed / level / captions are. The detail page opens on Stop.
+            let liveID = s.id
+            liveMeeting.begin(sessionID: liveID, startedAt: s.startedAt, ai: ai) { [weak self] lines, notes in
+                self?.persistLive(sessionID: liveID, lines: lines, notes: notes)
+            }
+            showingLiveMeeting = true
         }
         catch { message = "Recording could not start: \(error.localizedDescription)" }
     }
+    private func persistLive(sessionID: String, lines: [TranscriptLine], notes: MeetingNotes?) {
+        guard liveMeeting.activeSessionID == sessionID,
+              var current = store.sessions.first(where: { $0.id == sessionID }) else { return }
+        current.lines = lines
+        if let notes { current.notes = notes }
+        store.save(current)
+    }
+
     func stopRecording() {
         _ = recorder.stop()
+        // stop() flushes its last VAD segment; drain synchronously before closing
+        // the live queue so the final utterance is not lost to the next run loop.
+        drainVoiceSegments()
+        liveMeeting.finishAccepting()
+        showingLiveMeeting = false
         // Look up by recordingId, not `selected`: stopping happens on the list,
         // where selection is nil and the old lookup silently dropped endedAt.
         guard let id = recordingId, var s = store.sessions.first(where: { $0.id == id }) else {
-            recordingId = nil; return
+            recordingId = nil; liveMeeting.stop(); return
         }
         recordingId = nil
         s.endedAt = Date()
-        // Fallback transcript: keep the on-device live captions as one line so
-        // there is text even if server transcription fails. process() replaces it
-        // with the full transcription when that succeeds. Clearing here keeps a
-        // stale caption from leaking into the next session.
+        // Keep live bilingual lines and their draft notes. The on-device caption
+        // remains a fallback only when no live/cloud line was saved.
         let live = recorder.liveText; recorder.liveText = ""
-        if !live.isEmpty {
-            s.lines = [TranscriptLine(t: 0, speaker: 1, src: live)]
+        if !live.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            cumulativeFallbackCaptions[id] = live
+            if s.lines.isEmpty {
+                s.lines = [TranscriptLine(t: 0, speaker: 1, src: live)]
+            }
         }
         // Same for the caption failure reason: with it on the session, the
         // transcript page can say why there are no lines at all (offline
@@ -364,15 +412,15 @@ final class AppModel: ObservableObject {
         store.save(s)
         exporter.markPending(s)
         selection = s.id
-        // Speaker separation first, then the pipeline: applySpeakers groups the voices
-        // heard in this recording and lays the transcript over the segments, and the
-        // pipeline's server transcription must not race it. process() is async and
-        // sets `busy`, so this returns immediately and Stop stays responsive. Both run
-        // under the same Task so their saves stay ordered.
-        // Close the Record/retry window before the Task first suspends: otherwise a new
-        // recording can reset pendingSegs while this one's embeddings are still settling.
+        // Drain live segment requests before the whole-file pipeline so the two
+        // passes cannot reorder or overwrite one another's intermediate saves.
         busy = true
-        Task { await self.process(s, useRecordingSegments: true) }
+        Task {
+            await self.liveMeeting.waitForPending()
+            let latest = self.store.sessions.first(where: { $0.id == id }) ?? s
+            await self.process(latest, useRecordingSegments: true)
+            self.liveMeeting.stop()
+        }
     }
 
     /// Speaker separation at stop: cluster the segments' voiceprints in recording order
@@ -385,6 +433,7 @@ final class AppModel: ObservableObject {
     /// transcript comes later in process(). The alignment therefore runs here against the
     /// captions, and again in the pipeline once the server text arrives (refineTranscript).
     private func applySpeakers(_ s: Session) async {
+        let hasCumulativeFallback = cumulativeFallbackSessions.remove(s.id) != nil
         // Anything the gate closed between the last drain and the flush at stop.
         drainVoiceSegments()
         guard !pendingSegs.isEmpty else { return }
@@ -414,6 +463,32 @@ final class AppModel: ObservableObject {
             let seconds = Double(seg.samplesFrames) / CicadaTuning.sampleRate
             voices.append(seg.emb.flatMap { clusterer.label($0, seconds: seconds) })
         }
+        let hasCumulativeFallback = cumulativeFallbackSessions.remove(s.id) != nil
+        if !session.lines.isEmpty && !hasCumulativeFallback {
+            // Keep live text intact and attach embeddings only when live lines
+            // correspond closely to individual segments. A cumulative on-device
+            // fallback is instead split using the segment captions below.
+            if segs.count == 1, session.lines.count == 1 {
+                session.lines[0].voice = voices.first ?? nil
+            } else if session.lines.count > 1 {
+                for lineIndex in session.lines.indices {
+                    guard let match = segs.indices.min(by: {
+                        abs(segs[$0].t - session.lines[lineIndex].t) < abs(segs[$1].t - session.lines[lineIndex].t)
+                    }), abs(segs[match].t - session.lines[lineIndex].t) <= 1 else { continue }
+                    session.lines[lineIndex].voice = voices[match]
+                }
+            } else {
+                return
+            }
+            let numbers = SpeakerLabels.voiceNumbers(session.lines)
+            for i in session.lines.indices {
+                if let voice = session.lines[i].voice, let number = numbers[voice] {
+                    session.lines[i].speaker = number
+                }
+            }
+            store.save(session)
+            return
+        }
         // Lines: one per segment. A segment with no voice of its own (too short to
         // embed, or unlike every known voice) keeps voice nil — upstream ab787d4's
         // rule: a short reply in a voice not yet known does not join the answer
@@ -423,6 +498,10 @@ final class AppModel: ObservableObject {
             var l = TranscriptLine(t: seg.t, speaker: 1, src: seg.caption)
             l.voice = voices[i]
             lines.append(l)
+        }
+        if hasCumulativeFallback, let fallback = session.lines.first?.src,
+           !fallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines = RecordRefiner.refine(fallback, onto: lines, duration: session.duration)
         }
         // Speaker numbers: only shown voices get one; the rest keep 1 (S1).
         let numbers = SpeakerLabels.voiceNumbers(lines)
@@ -434,6 +513,12 @@ final class AppModel: ObservableObject {
         // of replacing it with caption fragments no voice was told apart in.
         guard lines.contains(where: { $0.voice != nil }) else { return }
         session.lines = lines
+        store.save(session)
+    }
+
+    private func updateImportProgress(_ session: inout Session, to value: Double) {
+        guard session.isImported, session.importState == .processing else { return }
+        session.importProgress = min(0.99, max(session.importProgress, value))
         store.save(session)
     }
 
@@ -451,7 +536,7 @@ final class AppModel: ObservableObject {
         var taskID: UIBackgroundTaskIdentifier = .invalid
         defer {
             pipelineActive = false
-            busy = false
+            busy = importingSessionID != nil
             // Include local-caption-only, failed and interrupted runs. Export failure
             // queues a retry in FolderExporter; it never changes the pipeline result.
             if let latest = store.sessions.first(where: { $0.id == s.id }),
@@ -521,7 +606,13 @@ final class AppModel: ObservableObject {
     private func runPipeline(_ s: Session, retranscribe: Bool) async {
         let hasText = s.lines.contains { !$0.src.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard AISettings.isConfigured || (!retranscribe && hasText && AIClient.Side.notes.isConfigured) else {
-            message = "Set the API base URL and key in Settings › AI Service."
+            let reason = "Set the API base URL and key in Settings › AI Service."
+            message = reason
+            if var current = store.sessions.first(where: { $0.id == s.id }), current.isImported {
+                current.processingState = .failed
+                current.lastError = reason
+                store.save(current)
+            }
             return
         }
         var s = s
@@ -529,6 +620,7 @@ final class AppModel: ObservableObject {
         s.processingState = .running
         s.lastError = nil
         store.save(s)
+        updateImportProgress(&s, to: 0.4)
 
         // Step 1 — transcribe. Skipped when a server transcription has already
         // succeeded once: a refresh after a notes-only failure must not re-upload
@@ -546,6 +638,7 @@ final class AppModel: ObservableObject {
                 } else {
                     text = try await ai.transcribe(audioURL: url)
                 }
+                if pipelineCancelled { throw CancellationError() }
                 if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     // A partial replacement must not destroy a complete saved transcript.
                     if retranscribe && failedChunks > 0 {
@@ -580,7 +673,8 @@ final class AppModel: ObservableObject {
                         }
                     }
                     s.lines = replacement
-                    s.notes = nil
+                    // Keep a live notes draft until this formal notes pass returns;
+                    // a transcript refresh alone is not a successful notes update.
                     s.transcribed = true
                     s.failedChunkCount = failedChunks
                     replacedTranscript = true
@@ -599,8 +693,19 @@ final class AppModel: ObservableObject {
                     }
                     store.save(s)
                 }
-            } catch { errors.append("Transcription failed: \(error.localizedDescription)") }
+            } catch is CancellationError {
+                // The interruption state is persisted below without treating cancellation as an ASR failure.
+            } catch {
+                if !pipelineCancelled { errors.append("Transcription failed: \(error.localizedDescription)") }
+            }
         }
+        if pipelineCancelled {
+            s.processingState = .failed
+            s.lastError = errors.isEmpty ? "Processing was interrupted." : errors.joined(separator: " · ")
+            store.save(s)
+            return
+        }
+        updateImportProgress(&s, to: 0.65)
         if retranscribe && !replacedTranscript {
             s.processingState = .failed
             s.lastError = errors.isEmpty ? "No new transcript was returned. The existing transcript and notes were kept." : errors.joined(separator: " · ")
@@ -620,16 +725,26 @@ final class AppModel: ObservableObject {
         // A translate failure must not stop notes: the line keeps its src text.
         if AISettings.isConfigured && AISettings.simultaneousInterpretation && !s.lines.isEmpty && AISettings.targetLang != "auto" {
             for i in s.lines.indices where !s.lines[i].src.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                do { s.lines[i].dst = try await ai.translate(s.lines[i].src, to: AISettings.targetLang) }
-                catch { errors.append("Translation failed: \(error.localizedDescription)"); break }
+                if pipelineCancelled { break }
+                do {
+                    let translated = try await ai.translate(s.lines[i].src, to: AISettings.targetLang)
+                    if pipelineCancelled { break }
+                    s.lines[i].dst = translated
+                } catch is CancellationError {
+                    break
+                } catch {
+                    if !pipelineCancelled { errors.append("Translation failed: \(error.localizedDescription)") }
+                    break
+                }
             }
-            store.save(s)
+            if !pipelineCancelled { store.save(s) }
         }
         if pipelineCancelled {
             s.processingState = .failed
             s.lastError = errors.isEmpty ? "Processing was interrupted." : errors.joined(separator: " · ")
             store.save(s); return
         }
+        updateImportProgress(&s, to: 0.82)
 
         // Step 3 — notes. Runs whenever ANY transcript text exists (server
         // transcript or the liveText fallback line); a step-1/2 error above
@@ -645,10 +760,22 @@ final class AppModel: ObservableObject {
             return "\(who): \(l.src)"
         }.joined(separator: "\n")
         if !transcript.isEmpty {
-            do { s.notes = try await ai.meetingNotes(transcript: transcript) }
-            catch { errors.append("Notes failed: \(error.localizedDescription)") }
+            do {
+                let updatedNotes = try await ai.meetingNotes(transcript: transcript)
+                if !pipelineCancelled, !updatedNotes.isEmpty { s.notes = updatedNotes }
+            } catch is CancellationError {
+                // Cancellation is persisted below as an interrupted partial run.
+            } catch {
+                if !pipelineCancelled { errors.append("Notes failed: \(error.localizedDescription)") }
+            }
         } else if s.audioFile?.isEmpty == false {
             errors.append("No transcript text to write notes from.")
+        }
+        if pipelineCancelled {
+            s.processingState = .failed
+            s.lastError = errors.isEmpty ? "Processing was interrupted." : errors.joined(separator: " · ")
+            store.save(s)
+            return
         }
 
         s.lastError = errors.isEmpty ? nil : errors.joined(separator: " · ")
@@ -667,10 +794,283 @@ final class AppModel: ObservableObject {
         exporter.write(current)
     }
 
+    func pickMedia() {
+        guard !busy, !startingRecording, !recorder.isRecording, importingSessionID == nil else { return }
+        MediaPickerPresenter.shared.present { [weak self] url in self?.importMedia(url) }
+    }
+
+    private func importMedia(_ url: URL) {
+        guard !busy, !startingRecording, !recorder.isRecording, importingSessionID == nil else { return }
+        var session = Session()
+        session.sourceFile = url.lastPathComponent
+        session.importState = .queued
+        let destination = store.importedSourceURL(for: session.id, filename: url.lastPathComponent)
+        session.importSourceFile = destination.lastPathComponent
+        store.save(session)
+        selection = session.id
+        resumeImport(session, copyFrom: url)
+    }
+
+    func resumeImport(_ snapshot: Session, copyFrom: URL? = nil) {
+        guard !busy, !pipelineActive, !startingRecording, !recorder.isRecording,
+              importingSessionID == nil,
+              var session = store.sessions.first(where: { $0.id == snapshot.id }), session.isImported else { return }
+        let cancellation = MediaImportCancellation()
+        importCancellation = cancellation
+        importingSessionID = session.id
+        busy = true
+        session.lastError = nil
+        store.save(session)
+        let copyScopeStarted = copyFrom?.startAccessingSecurityScopedResource() ?? false
+        importJobTask = Task { [weak self] in
+            defer {
+                if copyScopeStarted, let copyFrom { copyFrom.stopAccessingSecurityScopedResource() }
+            }
+            guard let self else { return }
+            let id = session.id
+            let grant = UIApplication.shared.beginBackgroundTask(withName: "cicada-import") { [weak self] in
+                cancellation.cancel()
+                Task { @MainActor in self?.importJobTask?.cancel() }
+            }
+            defer {
+                if grant != .invalid { UIApplication.shared.endBackgroundTask(grant) }
+                self.importingSessionID = nil
+                self.importCancellation = nil
+                self.importJobTask = nil
+                self.busy = false
+            }
+            do {
+                var current = self.store.sessions.first(where: { $0.id == id }) ?? session
+                if let copyFrom {
+                    guard let sourceDestination = self.store.importURL(for: current) else {
+                        throw MediaImportError(message: "Could not create a local source-file path.")
+                    }
+                    try await Task.detached(priority: .userInitiated) {
+                        try MediaImporter.copySource(from: copyFrom, to: sourceDestination,
+                            sourceAlreadyScoped: copyScopeStarted,
+                            isCancelled: { cancellation.isCancelled },
+                            progress: { fraction in
+                                Task { @MainActor [weak self] in
+                                    guard let self, !cancellation.isCancelled,
+                                          var saved = self.store.sessions.first(where: { $0.id == id }),
+                                          saved.importState == .queued else { return }
+                                    saved.importProgress = fraction * 0.05
+                                    self.store.save(saved)
+                                }
+                            })
+                    }.value
+                    if cancellation.isCancelled || Task.isCancelled { throw CancellationError() }
+                    current = self.store.sessions.first(where: { $0.id == id }) ?? current
+                    current.importProgress = 0.05
+                    self.store.save(current)
+                    if cancellation.isCancelled || Task.isCancelled { throw CancellationError() }
+                }
+                let existingAudio = self.store.audioURL(for: current)
+                let hasExistingAudio = existingAudio.map { Recorder.audioSeconds(at: $0) > 0 } ?? false
+                if !hasExistingAudio {
+                    guard let source = self.store.importURL(for: current),
+                          FileManager.default.fileExists(atPath: source.path) else {
+                        throw MediaImportError(message: "The saved source file is missing. Choose the file again.")
+                    }
+                    current.importState = .extracting
+                    current.importProgress = 0
+                    self.store.save(current)
+                    let destination = self.store.recordingURL(for: id).deletingPathExtension().appendingPathExtension("wav")
+                    let seconds = try await Task.detached(priority: .userInitiated) {
+                        try MediaImporter.decodeAudio(from: source, to: destination,
+                            isCancelled: { cancellation.isCancelled }, progress: { fraction in
+                                Task { @MainActor [weak self] in
+                                    guard let self, !cancellation.isCancelled,
+                                          var saved = self.store.sessions.first(where: { $0.id == id }),
+                                          saved.importState == .extracting else { return }
+                                    // Progress is stage based, not an invented upload percentage.
+                                    let next = fraction * 0.35
+                                    if next - saved.importProgress >= 0.02 {
+                                        saved.importProgress = next
+                                        self.store.save(saved)
+                                    }
+                                }
+                            })
+                    }.value
+                    if cancellation.isCancelled { throw CancellationError() }
+                    current = self.store.sessions.first(where: { $0.id == id }) ?? current
+                    current.audioFile = destination.lastPathComponent
+                    current.endedAt = current.startedAt.addingTimeInterval(seconds)
+                    current.importState = .ready
+                    current.importProgress = 0.35
+                    self.store.save(current)
+                }
+                if cancellation.isCancelled { throw CancellationError() }
+                current.importState = .processing
+                self.store.save(current)
+                await self.process(current)
+                guard var result = self.store.sessions.first(where: { $0.id == id }) else { return }
+                if cancellation.isCancelled || Task.isCancelled { throw CancellationError() }
+                result.importState = result.processingState == .done ? .done : .failed
+                if result.importState == .done { result.importProgress = 1 }
+                self.store.save(result)
+            } catch {
+                guard var result = self.store.sessions.first(where: { $0.id == id }) else { return }
+                let paused = cancellation.isCancelled || Task.isCancelled || error is CancellationError
+                result.importState = paused ? .paused : .failed
+                result.processingState = .failed
+                result.lastError = paused ? "Import paused. Resume to restart the unfinished stage; the source and completed text are saved." : error.localizedDescription
+                self.store.save(result)
+                if !paused { self.message = result.lastError }
+            }
+        }
+    }
+
+    func pauseImport() {
+        guard importingSessionID != nil else { return }
+        importCancellation?.cancel()
+        importJobTask?.cancel()
+        pipelineCancelled = true
+    }
+
+    func editLine(sessionID: String, lineID: String, source: String, translation: String) {
+        guard !busy, !recorder.isRecording,
+              var current = store.sessions.first(where: { $0.id == sessionID }),
+              let index = current.lines.firstIndex(where: { $0.id == lineID }) else { return }
+        current.lines[index].src = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        let dst = translation.trimmingCharacters(in: .whitespacesAndNewlines)
+        current.lines[index].dst = dst.isEmpty ? nil : dst
+        store.save(current)
+        exporter.write(current)
+    }
+
     func exportMarkdown(_ s: Session) -> String { TranscriptExport.markdown(s) }
 }
 
 // MARK: - Views
+
+/// Foreground meeting page. Dismissing this view does not stop the Recorder;
+/// the records list keeps a permanent route back while the session is active.
+struct LiveMeetingView: View {
+    @EnvironmentObject var model: AppModel
+    @State private var page = 1
+
+    private var session: Session? {
+        guard let id = model.recordingId else { return nil }
+        return model.store.sessions.first { $0.id == id }
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    Circle().fill(model.recorder.paused ? Ink.secondary : Ink.accent)
+                        .frame(width: 9, height: 9)
+                    Text(model.recorder.paused ? "Paused" : "Listening")
+                        .font(.subheadline.weight(.semibold))
+                    Text(TranscriptExport.clock(model.recorder.elapsed))
+                        .font(.subheadline.monospacedDigit()).foregroundStyle(Ink.secondary)
+                    Spacer()
+                    Text("Auto → \(AISettings.targetLang.uppercased())")
+                        .font(.caption).foregroundStyle(Ink.secondary)
+                }
+                .padding(.horizontal, 20).padding(.vertical, 12)
+                Picker("Live meeting", selection: $page) {
+                    Text("Live notes").tag(0)
+                    Text("Subtitles").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 20).padding(.bottom, 8)
+
+                if model.recorder.paused {
+                    Text("The microphone is temporarily unavailable. Recording will resume when it can.")
+                        .font(.footnote).foregroundStyle(Ink.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20).padding(.bottom, 8)
+                }
+                if let problem = model.liveMeeting.problem {
+                    Text(problem).font(.footnote).foregroundStyle(Ink.accentText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20).padding(.bottom, 8)
+                }
+
+                if page == 0 {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 12) {
+                            if let notes = model.liveMeeting.notes, !notes.isEmpty {
+                                NotesView(notes: notes, state: .done)
+                            } else if model.liveMeeting.notesUpdating {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                    Text("Preparing the first notes draft…").foregroundStyle(Ink.secondary)
+                                }.padding(.top, 24)
+                            } else {
+                                Text("Live notes appear after a few spoken lines.")
+                                    .foregroundStyle(Ink.secondary).padding(.top, 24)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20).padding(.top, 8)
+                    }
+                } else {
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 12) {
+                                ForEach(Array(model.liveMeeting.lines.suffix(12))) { line in
+                                    VStack(alignment: .leading, spacing: 5) {
+                                        HStack {
+                                            Text("Speaker \(line.speaker)").font(.caption.weight(.semibold))
+                                            Spacer()
+                                            Text(TranscriptExport.clock(line.t)).font(.caption.monospacedDigit())
+                                                .foregroundStyle(Ink.tertiary)
+                                        }
+                                        if let dst = line.dst, !dst.isEmpty {
+                                            Text(dst).font(.body.weight(.medium))
+                                            Text(line.src).font(.footnote).foregroundStyle(Ink.secondary)
+                                        } else {
+                                            Text(line.src).font(.body)
+                                        }
+                                    }
+                                    .padding(12)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Ink.accentWash.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+                                    .id(line.id)
+                                }
+                                if model.liveMeeting.lines.isEmpty {
+                                    if !model.recorder.liveText.isEmpty {
+                                        VStack(alignment: .leading, spacing: 5) {
+                                            Text("On-device caption").font(.caption.weight(.semibold))
+                                                .foregroundStyle(Ink.secondary)
+                                            Text(model.recorder.liveText).font(.body)
+                                        }
+                                        .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(Ink.line.opacity(0.35), in: RoundedRectangle(cornerRadius: 12))
+                                    } else {
+                                        Text("Waiting for speech…")
+                                            .foregroundStyle(Ink.secondary).padding(.top, 32)
+                                            .frame(maxWidth: .infinity)
+                                    }
+                                }
+                            }
+                            .padding(.horizontal, 16).padding(.top, 8).padding(.bottom, 16)
+                        }
+                        .onChange(of: model.liveMeeting.lines.last?.id) { id in
+                            if let id { withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(id, anchor: .bottom) } }
+                        }
+                    }
+                }
+                Spacer(minLength: 0)
+                Button("Stop meeting", role: .destructive) { model.stopRecording() }
+                    .buttonStyle(.borderedProminent).tint(Ink.accent)
+                    .padding(.top, 8).padding(.bottom, 16)
+            }
+            .navigationTitle("In meeting")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Done") { model.showingLiveMeeting = false }
+                }
+            }
+            .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
+            .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
+        }
+    }
+}
 
 struct RootView: View {
     @EnvironmentObject var model: AppModel
@@ -692,6 +1092,13 @@ struct RootView: View {
         .alert("Cicada", isPresented: Binding(get: { model.message != nil }, set: { if !$0 { model.message = nil } })) {
             Button("OK") { model.message = nil }
         } message: { Text(model.message ?? "") }
+        .fullScreenCover(isPresented: $model.showingLiveMeeting) {
+            LiveMeetingView()
+                .environmentObject(model)
+        }
+        .fullScreenCover(isPresented: $model.showingFaceToFace) {
+            FaceToFaceView().environmentObject(model)
+        }
     }
 }
 struct TabBtn: View {
@@ -748,7 +1155,11 @@ struct RecordsList: View {
                     }
                     Spacer()
                     if model.recorder.isRecording {
-                        Button("Stop", role: .destructive) { model.stopRecording() }
+                        VStack(alignment: .trailing, spacing: 6) {
+                            Button("Open meeting") { model.showingLiveMeeting = true }
+                                .buttonStyle(.bordered)
+                            Button("Stop", role: .destructive) { model.stopRecording() }
+                        }
                     } else {
                         Button { Task { await model.startRecording() } } label: {
                             Image(systemName: "mic.fill").font(.title2)
@@ -759,12 +1170,50 @@ struct RecordsList: View {
                 }
                 .padding(.vertical, 4)
             }
+            Section {
+                Button { model.showingFaceToFace = true } label: {
+                    Label("Face-to-face · hold to speak", systemImage: "person.2.wave.2")
+                }
+                .disabled(model.busy || model.recorder.isRecording || model.importingSessionID != nil)
+            }
+            Section("Import audio or video") {
+                if let id = model.importingSessionID,
+                   let active = model.store.sessions.first(where: { $0.id == id }) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(active.sourceFile ?? "Media file").font(.subheadline.weight(.medium))
+                        ProgressView(value: active.importProgress)
+                        Text(active.importState == .extracting ? "Extracting audio…" : "Transcribing and preparing notes…")
+                            .font(.footnote).foregroundStyle(Ink.secondary)
+                        Button("Pause import", role: .destructive) { model.pauseImport() }
+                    }
+                } else {
+                    Button { model.pickMedia() } label: {
+                        Label("Choose audio or video…", systemImage: "square.and.arrow.down")
+                    }
+                    .disabled(model.busy || model.recorder.isRecording)
+                    Text("Choose a file from Files. Keep Cicada open for reliable import; iOS may suspend background work.")
+                        .font(.footnote).foregroundStyle(Ink.secondary)
+                }
+            }
             Section("Meetings") {
                 ForEach(model.store.sessions) { s in
-                    Button { model.selection = s.id } label: {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(TranscriptExport.displayTitle(s)).font(.body.weight(.medium)).foregroundStyle(Ink.ink)
-                            Text("\(Int(s.duration/60)) min · \(s.lines.count) lines").font(.footnote).foregroundStyle(Ink.secondary)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Button { model.selection = s.id } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(TranscriptExport.displayTitle(s)).font(.body.weight(.medium)).foregroundStyle(Ink.ink)
+                                Text("\(Int(s.duration/60)) min · \(s.lines.count) lines\(s.isImported ? " · Imported" : "")")
+                                    .font(.footnote).foregroundStyle(Ink.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        if s.isImported && (s.importState == .paused || s.importState == .failed || s.importState == .ready) {
+                            Button(s.importState == .failed ? "Retry import" : "Resume import") {
+                                model.resumeImport(s)
+                            }
+                            .font(.footnote)
+                            .disabled(model.busy || model.recorder.isRecording)
+                        } else if s.isImported && s.importState == .processing {
+                            Text("Import processing…").font(.footnote).foregroundStyle(Ink.secondary)
                         }
                     }
                 }
@@ -795,6 +1244,15 @@ struct RecordDetail: View {
     @State private var speakerName = ""
     @State private var showingName = false
     @State private var confirmingRetranscription = false
+    @State private var editingLineID: String?
+    @State private var editedSource = ""
+    @State private var editedTranslation = ""
+
+    private func beginEditing(_ line: TranscriptLine) {
+        editingLineID = line.id
+        editedSource = line.src
+        editedTranslation = line.dst ?? ""
+    }
 
     private func nameAction(for line: TranscriptLine) -> (() -> Void)? {
         guard !model.busy, !model.recorder.isRecording,
@@ -822,6 +1280,25 @@ struct RecordDetail: View {
                     Text(TranscriptExport.displayTitle(session)).font(.title.bold())
                     Text("\(Int(session.duration/60)) min · \(session.lines.count) lines")
                         .font(.footnote).foregroundStyle(Ink.secondary).padding(.top, 4)
+                    if session.isImported {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label(session.sourceFile ?? "Imported media", systemImage: "doc")
+                                .font(.subheadline).lineLimit(2)
+                            Text("Import: \(session.importState.rawValue)").font(.caption)
+                            ProgressView(value: min(1, max(0, session.importProgress)))
+                            if model.importingSessionID == session.id {
+                                Button("Pause import") { model.pauseImport() }
+                            } else if session.importState != .done {
+                                Button("Resume / retry import") { model.resumeImport(session) }
+                                    .disabled(model.busy || model.recorder.isRecording || model.importingSessionID != nil)
+                            }
+                            if let error = session.lastError {
+                                Text(error).font(.footnote).foregroundStyle(Ink.secondary)
+                            }
+                            Text("Keep Cicada open. Progress marks completed stages; iOS may pause background work. Resume restarts an unfinished stage.")
+                                .font(.caption).foregroundStyle(Ink.secondary)
+                        }.padding(.vertical, 12)
+                    }
                     Picker("Page", selection: $page) {
                         Text("Transcript").tag(0); Text("Notes").tag(1)
                     }.pickerStyle(.segmented).padding(.top, 16)
@@ -831,13 +1308,17 @@ struct RecordDetail: View {
                         // them here once instead of per row.
                         let numbers = SpeakerLabels.voiceNumbers(session.lines)
                         ForEach(session.lines) { l in
-                            TranscriptRow(line: l, numbers: numbers, playing: l.id == playing,
-                                          onName: nameAction(for: l))
-                                .id(l.id)
-                                // Tapping a line starts playback from its timestamp
-                                // (the official app's seek-on-line-tap).
-                                .contentShape(Rectangle())
-                                .onTapGesture { following = true; player.seek(l.t) }
+                            VStack(alignment: .leading, spacing: 2) {
+                                TranscriptRow(line: l, numbers: numbers, playing: l.id == playing,
+                                              onName: nameAction(for: l))
+                                    .contentShape(Rectangle())
+                                    .onTapGesture { following = true; player.seek(l.t) }
+                                if session.isImported {
+                                    Button("Edit line") { beginEditing(l) }
+                                        .font(.caption).padding(.leading, 42)
+                                }
+                            }
+                            .id(l.id)
                         }
                         if session.lines.isEmpty {
                             Text("No transcript yet.").foregroundStyle(Ink.secondary).padding(.top, 24)
@@ -910,6 +1391,32 @@ struct RecordDetail: View {
                     }
                 }
             }
+            .sheet(isPresented: Binding(
+                get: { editingLineID != nil }, set: { if !$0 { editingLineID = nil } })) {
+                NavigationStack {
+                    Form {
+                        TextField("Original text", text: $editedSource, axis: .vertical)
+                            .lineLimit(3...8)
+                        TextField("Translation (optional)", text: $editedTranslation, axis: .vertical)
+                            .lineLimit(3...8)
+                    }
+                    .navigationTitle("Edit transcript")
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Cancel") { editingLineID = nil }
+                        }
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Save") {
+                                if let id = editingLineID {
+                                    model.editLine(sessionID: session.id, lineID: id,
+                                                   source: editedSource, translation: editedTranslation)
+                                }
+                                editingLineID = nil
+                            }
+                        }
+                    }
+                }
+            }
             .alert("Name this speaker", isPresented: $showingName) {
                 TextField("Name (blank to clear)", text: $speakerName)
                 Button("Save") {
@@ -944,6 +1451,9 @@ struct RecordDetail: View {
             .onChange(of: session.id) { _ in
                 player.load(store: model.store, session: session)
             }
+            .onChange(of: session.audioFile) { _ in
+                player.load(store: model.store, session: session)
+            }
             .onDisappear { player.stop() }   // leaving the screen stops playback
         }
     }
@@ -962,6 +1472,7 @@ struct RecordingBanner: View {
                     Text(TranscriptExport.clock(model.recorder.elapsed)).font(.footnote.monospacedDigit())
                 }
                 Spacer()
+                Button("Open") { model.showingLiveMeeting = true }
                 Button("Stop", role: .destructive) { model.stopRecording() }
             }
             if model.recorder.paused {

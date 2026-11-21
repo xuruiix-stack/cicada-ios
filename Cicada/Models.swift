@@ -54,6 +54,17 @@ enum ProcessingState: String, Codable {
     case failed        // a step failed; lastError holds the reason
 }
 
+enum ImportState: String, Codable {
+    case none
+    case queued
+    case extracting
+    case ready
+    case processing
+    case paused
+    case failed
+    case done
+}
+
 struct Session: Identifiable, Codable, Equatable {
     var id: String = UUID().uuidString
     var title: String = ""
@@ -62,6 +73,10 @@ struct Session: Identifiable, Codable, Equatable {
     var lines: [TranscriptLine] = []
     var notes: MeetingNotes?
     var audioFile: String?   // relative filename under Documents/Recordings
+    var sourceFile: String?  // original imported filename, or nil for microphone meetings
+    var importSourceFile: String? // copied source under Documents/Cicada/Imports
+    var importState: ImportState = .none
+    var importProgress: Double = 0
     // Pipeline state, persisted with the session. Synthesized Codable ignores
     // default values (a missing key throws for non-optional fields), which would
     // make every pre-existing session JSON fail to decode and disappear from
@@ -81,11 +96,8 @@ struct Session: Identifiable, Codable, Equatable {
     /// Chunks that failed transcription even after their retry (Ling path).
     var failedChunkCount = 0
     var duration: Double { endedAt.map { $0.timeIntervalSince(startedAt) } ?? 0 }
-    /// The folder-export contract's `source` field is "file" only for imported
-    /// files; this build records only meetings, so it stays nil (→ "meeting")
-    /// until import exists. Computed, not persisted: session JSON schema is
-    /// unchanged this round.
-    var sourceFile: String? { nil }
+    /// Imported files retain their display name for the record list and folder export.
+    var isImported: Bool { sourceFile != nil }
 }
 
 extension Session {
@@ -107,8 +119,8 @@ extension Session {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, title, startedAt, endedAt, lines, notes, audioFile
-        case processingState, transcribed, lastError, liveCaptionNote, failedChunkCount
+        case id, title, startedAt, endedAt, lines, notes, audioFile, sourceFile, importSourceFile
+        case importState, importProgress, processingState, transcribed, lastError, liveCaptionNote, failedChunkCount
     }
     /// Tolerant decoding: every field falls back to its default, so session
     /// files written before the pipeline-state fields existed keep loading.
@@ -121,6 +133,10 @@ extension Session {
         lines = try c.decodeIfPresent([TranscriptLine].self, forKey: .lines) ?? []
         notes = try c.decodeIfPresent(MeetingNotes.self, forKey: .notes)
         audioFile = try c.decodeIfPresent(String.self, forKey: .audioFile)
+        sourceFile = try c.decodeIfPresent(String.self, forKey: .sourceFile)
+        importSourceFile = try c.decodeIfPresent(String.self, forKey: .importSourceFile)
+        importState = try c.decodeIfPresent(ImportState.self, forKey: .importState) ?? .none
+        importProgress = try c.decodeIfPresent(Double.self, forKey: .importProgress) ?? 0
         processingState = try c.decodeIfPresent(ProcessingState.self, forKey: .processingState) ?? .idle
         transcribed = try c.decodeIfPresent(Bool.self, forKey: .transcribed) ?? false
         lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
@@ -136,6 +152,10 @@ extension Session {
         try c.encode(lines, forKey: .lines)
         try c.encodeIfPresent(notes, forKey: .notes)
         try c.encodeIfPresent(audioFile, forKey: .audioFile)
+        try c.encodeIfPresent(sourceFile, forKey: .sourceFile)
+        try c.encodeIfPresent(importSourceFile, forKey: .importSourceFile)
+        try c.encode(importState, forKey: .importState)
+        try c.encode(importProgress, forKey: .importProgress)
         try c.encode(processingState, forKey: .processingState)
         try c.encode(transcribed, forKey: .transcribed)
         try c.encodeIfPresent(lastError, forKey: .lastError)
@@ -175,6 +195,11 @@ enum TranscriptExport {
     }
     static func displayTitle(_ s: Session) -> String {
         if !s.title.isEmpty { return s.title }
+        if let source = s.sourceFile, !source.isEmpty {
+            let filename = (source as NSString).lastPathComponent
+            let title = (filename as NSString).deletingPathExtension
+            if !title.isEmpty { return title }
+        }
         let df = DateFormatter(); df.dateFormat = "M月d日 HH:mm"
         return df.string(from: s.startedAt)
     }

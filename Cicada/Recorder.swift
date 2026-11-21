@@ -1,6 +1,7 @@
 import AVFoundation
 import Speech
 import Foundation
+import UIKit
 import os
 
 /// One VAD segment (segmenter.py's gate): the audio between a voice starting and a pause
@@ -57,10 +58,16 @@ final class Recorder: NSObject, ObservableObject {
     /// True when a resume must wait for the app to become active again (the
     /// interruption ended while the app was still behind a call screen).
     private var resumeWhenActive = false
+    /// The media server reset and rebuilding the input graph must wait for foreground.
+    private var engineRecoveryPending = false
     private var recognizer: SFSpeechRecognizer?
+    private let recognitionLock = NSLock()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
     private var recognitionGeneration = UUID()
+    /// Live captions are intentionally suspended in the background; recording is not.
+    private var recognitionSuspended = false
+    private var appInBackground = false
     /// Mic tap (hardware rate, mono) → 16 kHz mono the file and recognizer consume.
     private var converter: AVAudioConverter?
     private let sinkFormat = AVAudioFormat(standardFormatWithSampleRate: CicadaTuning.sampleRate, channels: 1)!
@@ -118,6 +125,7 @@ final class Recorder: NSObject, ObservableObject {
                 AVLinearPCMIsNonInterleaved: false])
         }
         catch {
+            file = nil
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
             throw error
         }
@@ -146,6 +154,9 @@ final class Recorder: NSObject, ObservableObject {
             throw error
         }
         startedAt = Date(); isRecording = true
+        appInBackground = UIApplication.shared.applicationState != .active
+        recognitionSuspended = false
+        engineRecoveryPending = false
         lastFootprintLog = Date()
         error = nil   // a new recording starts with a clean slate; AppModel shows the last one
         debugLog("recorder: started")
@@ -167,50 +178,103 @@ final class Recorder: NSObject, ObservableObject {
             if !rec.supportsOnDeviceRecognition {
                 recognitionError = "On-device speech recognition is not available for this language on this device, so there are no offline live captions. The recording itself is unaffected; the transcript will be generated when online."
             }
-            let req = SFSpeechAudioBufferRecognitionRequest()
-            req.shouldReportPartialResults = true; req.requiresOnDeviceRecognition = true
-            request = req
-            let generation = recognitionGeneration
-            task = rec.recognitionTask(with: req) { [weak self] result, err in
-                if let r = result {
-                    DispatchQueue.main.async {
-                        guard let self, self.recognitionGeneration == generation else { return }
-                        self.liveText = r.bestTranscription.formattedString
-                        // Word timestamps for the segment captions (speaker separation):
-                        // SFTranscription's timestamps run on the recognizer's own clock,
-                        // which starts when the request was made — the same moment as
-                        // `startedAt`, so they read as recording time directly.
-                        self.timedWords = r.bestTranscription.segments.map {
-                            (mid: $0.timestamp + $0.duration / 2, text: String($0.substring))
-                        }
-                    }
-                }
-                // A recognition error is not the recording's end: audio keeps
-                // going to the file. Say WHY the captions stopped, in plain words.
-                // Cancellation is not an error here: stop() cancels the task,
-                // and the cancel callback must not paint a failure note over a
-                // recording whose captions worked fine (SFSpeechRecognizer
-                // delivers an error on cancel; code 216 in its own domain).
-                if let e = err, !Self.isCancellation(e) {
-                    DispatchQueue.main.async {
-                        guard let self, self.recognitionGeneration == generation else { return }
-                        guard self.recognitionError == nil else { return }
-                        // With requiresOnDeviceRecognition, an error before any
-                        // result at all is, in practice, the on-device model for
-                        // this locale never having been downloaded (the exact
-                        // kAFAssistantErrorDomain code varies by OS). After some
-                        // results, it's a mid-run failure — keep the system's
-                        // wording for that one.
-                        self.recognitionError = self.liveText.isEmpty
-                            ? "The on-device speech model for this language is not downloaded, so there are no offline live captions. Connect to the internet once so iOS can download it — after that, live captions work offline too. The recording itself is unaffected; the transcript will be generated when online."
-                            : Self.describeRecognitionError(e)
-                    }
-                }
-            }
+            startRecognition(using: rec)
         } else {
             recognitionError = "No speech recognizer exists for this language, so there are no offline live captions. The recording itself is unaffected; the transcript will be generated when online."
         }
         observeAudioSession()
+    }
+
+    /// Starts a fresh live-caption request without losing earlier foreground text.
+    /// The request's timestamps start at zero, so offset them to the CAF file clock.
+    private func startRecognition(using rec: SFSpeechRecognizer) {
+        let req = SFSpeechAudioBufferRecognitionRequest()
+        req.shouldReportPartialResults = true
+        req.requiresOnDeviceRecognition = true
+
+        let textPrefix = liveText
+        let wordsPrefix = timedWords
+        gateLock.lock()
+        let timeOffset = Double(capturedFrames) / CicadaTuning.sampleRate
+        gateLock.unlock()
+        recognitionLock.lock()
+        let generation = recognitionGeneration
+        request = req
+        recognitionLock.unlock()
+        let recognitionTask = rec.recognitionTask(with: req) { [weak self] result, err in
+            if let r = result {
+                DispatchQueue.main.async {
+                    guard let self, self.isCurrentRecognition(generation) else { return }
+                    let text = r.bestTranscription.formattedString
+                    self.liveText = [textPrefix, text].filter { !$0.isEmpty }.joined(separator: " ")
+                    self.timedWords = wordsPrefix + r.bestTranscription.segments.map {
+                        (mid: timeOffset + $0.timestamp + $0.duration / 2, text: String($0.substring))
+                    }
+                }
+            }
+            // A recognition error is not the recording's end: audio keeps
+            // going to the file. Cancellation is expected when the app backgrounds.
+            if let e = err, !Self.isCancellation(e) {
+                DispatchQueue.main.async {
+                    guard let self, self.isCurrentRecognition(generation) else { return }
+                    guard self.recognitionError == nil else { return }
+                    self.recognitionError = self.liveText.isEmpty
+                        ? "The on-device speech model for this language is not downloaded, so there are no offline live captions. Connect to the internet once so iOS can download it — after that, live captions work offline too. The recording itself is unaffected; the transcript will be generated when online."
+                        : Self.describeRecognitionError(e)
+                }
+            }
+        }
+        recognitionLock.lock()
+        let stillCurrent = recognitionGeneration == generation
+        if stillCurrent { task = recognitionTask }
+        recognitionLock.unlock()
+        if !stillCurrent { recognitionTask.cancel() }
+    }
+
+    private func isCurrentRecognition(_ generation: UUID) -> Bool {
+        recognitionLock.lock(); defer { recognitionLock.unlock() }
+        return recognitionGeneration == generation
+    }
+
+    /// Backgrounding is a recording state, not a stop request: keep the active
+    /// audio session, input tap and CAF writer; only remove Speech's foreground-only work.
+    private func appEnteredBackground() {
+        appInBackground = true
+        suspendRecognition()
+        guard isRecording else { return }
+        if !(engine?.isRunning ?? false), !held {
+            paused = true
+            resumeWhenActive = true
+            debugLog("recorder: engine is stopped in background; recovery deferred")
+        }
+        debugLog("recorder: entered background; audio capture retained")
+    }
+
+    /// Stop only Speech processing; the engine tap and CAF writer remain active.
+    private func suspendRecognition() {
+        guard isRecording else { return }
+        recognitionLock.lock()
+        guard request != nil || task != nil else {
+            recognitionLock.unlock()
+            return
+        }
+        recognitionGeneration = UUID()
+        let oldRequest = request
+        request = nil
+        let oldTask = task
+        task = nil
+        recognitionLock.unlock()
+        oldRequest?.endAudio()
+        oldTask?.cancel()
+        recognitionSuspended = true
+        debugLog("recorder: live recognition suspended")
+    }
+
+    private func resumeRecognitionIfNeeded() {
+        guard isRecording, !appInBackground, !paused, recognitionSuspended, let recognizer else { return }
+        recognitionSuspended = false
+        startRecognition(using: recognizer)
+        debugLog("recorder: live recognition resumed")
     }
 
     // MARK: - Interruption and route changes (upstream RoomListen/RoomAudio)
@@ -229,6 +293,9 @@ final class Recorder: NSObject, ObservableObject {
         observers = [
             center.addObserver(forName: AVAudioSession.interruptionNotification, object: session, queue: .main) {
                 [weak self] n in self?.interrupted(n)
+            },
+            center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) {
+                [weak self] _ in self?.appEnteredBackground()
             },
             // A route change (headphones out, Bluetooth off) stops the engine
             // with a configuration change: on again in the new input's format,
@@ -252,10 +319,11 @@ final class Recorder: NSObject, ObservableObject {
         guard isRecording, let raw = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
         if type == .began {
-            guard !paused else { return }
+            guard !held else { return }
             held = true
             paused = true
             level = 0
+            suspendRecognition()
             engine?.pause()
             debugLog("recorder: interruption began")
             return
@@ -264,20 +332,19 @@ final class Recorder: NSObject, ObservableObject {
         let optionsRaw = n.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
         let shouldResume = AVAudioSession.InterruptionOptions(rawValue: optionsRaw).contains(.shouldResume)
         debugLog("recorder: interruption ended shouldResume=\(shouldResume)")
-        guard paused else { return }
-        if shouldResume {
+        guard held else { return }
+        held = false
+        resumeWhenActive = true
+        paused = true
+        if shouldResume && !appInBackground {
             do { try resume() }
             catch {
-                // The system won't hand the microphone back yet (the app can
-                // still be behind a call screen): try again on activation.
-                debugLog("recorder: resume failed: \(error.localizedDescription)")
-                resumeWhenActive = true
+                // Keep the file open if the system still refuses input; activation retries.
+                debugLog("recorder: resume deferred: \(error.localizedDescription)")
+                if UIApplication.shared.applicationState == .active { appBecameActive() }
             }
-        } else {
-            // Not ours to take back (a call still going in the background):
-            // wait for the app to become active, and give up honestly if
-            // even then the audio does not return.
-            resumeWhenActive = true
+        } else if !appInBackground {
+            appBecameActive()
         }
     }
 
@@ -287,6 +354,14 @@ final class Recorder: NSObject, ObservableObject {
     /// engine itself (it re-reads the route); our job is to notice and re-tap.
     private func routeChanged() {
         guard isRecording, !held, !(engine?.isRunning ?? false) else { return }
+        if appInBackground {
+            // iOS may reject a new input I/O graph while the app is backgrounded.
+            // Keep the session/recording alive and retry from didBecomeActive.
+            paused = true
+            resumeWhenActive = true
+            debugLog("recorder: route changed in background; deferring engine restart")
+            return
+        }
         debugLog("recorder: engine configuration changed, restarting")
         do { try resume() }
         catch {
@@ -296,39 +371,54 @@ final class Recorder: NSObject, ObservableObject {
     }
 
     /// The media server was reset while recording: the engine object is now
-    /// invalid (its underlying units point at a dead server) and the session
-    /// lost its category/activation. Rebuild both from scratch and re-tap; the
-    /// CAF file keeps its format, so the recording continues into the same
-    /// file as if nothing had happened. If the rebuild fails, finalize honestly
-    /// through the existing onRecordingLost path instead of stalling.
+    /// invalid. A reset in the background cannot safely create new input I/O,
+    /// so retain the session/file and rebuild on the next activation instead of
+    /// turning a transient reset into stop() and loss of background audio.
     private func mediaServicesReset() {
         guard isRecording else { return }
         debugLog("recorder: media services were reset, rebuilding engine")
+        suspendRecognition()
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         engine = nil
         converter = nil
-        held = false
         paused = true
+        engineRecoveryPending = true
+        resumeWhenActive = true
+        guard !appInBackground, !held else {
+            debugLog("recorder: media reset deferred until audio is available")
+            return
+        }
         do {
-            let newEngine = AVAudioEngine()
-            try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker])
-            try AVAudioSession.sharedInstance().setActive(true)
-            engine = newEngine
-            // Re-attach the configuration-change observer to the NEW engine (the
-            // old one's observer watched a dead object) and track it in `observers`
-            // so stop() removes it with the rest.
-            let center = NotificationCenter.default
-            let token = center.addObserver(forName: .AVAudioEngineConfigurationChange, object: newEngine, queue: .main) {
-                [weak self] _ in self?.routeChanged()
-            }
-            observers.append(token)
-            try tapAndStart(engine: newEngine)
+            try rebuildEngine()
+            engineRecoveryPending = false
+            resumeWhenActive = false
             paused = false
+            resumeRecognitionIfNeeded()
         } catch {
             debugLog("recorder: rebuild after media reset failed: \(error.localizedDescription)")
-            recordingLost("The device's audio services restarted and the microphone could not be recovered, so the recording was stopped. The audio up to that point is saved.")
+            if !appInBackground {
+                recordingLost("The device's audio services restarted and the microphone could not be recovered, so the recording was stopped. The audio up to that point is saved.")
+            }
         }
+    }
+
+    private func rebuildEngine() throws {
+        let newEngine = AVAudioEngine()
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker])
+        try session.setActive(true)
+        engine = newEngine
+        // Follow configuration changes on the replacement engine as well.
+        let token = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: newEngine, queue: .main
+        ) { [weak self] _ in self?.routeChanged() }
+        observers.append(token)
+        try tapAndStart(engine: newEngine)
+        engineRecoveryPending = false
+        held = false
+        resumeWhenActive = false
+        paused = false
     }
 
     /// The microphone again after an interruption or route change, in whatever
@@ -336,11 +426,18 @@ final class Recorder: NSObject, ObservableObject {
     /// session, and re-tap the input when the engine is down. The file keeps
     /// its 16 kHz format; only the tap's input format can change.
     private func resume() throws {
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker])
+        try session.setActive(true)
+        if engineRecoveryPending || engine == nil {
+            try rebuildEngine()
+        } else if let engine, !engine.isRunning {
+            try tapAndStart(engine: engine)
+        }
         held = false
         resumeWhenActive = false
-        try AVAudioSession.sharedInstance().setActive(true)
-        if let engine, !engine.isRunning { try tapAndStart(engine: engine) }
         paused = false
+        resumeRecognitionIfNeeded()
         debugLog("recorder: resumed")
     }
 
@@ -364,17 +461,24 @@ final class Recorder: NSObject, ObservableObject {
         try engine.start()
     }
 
-    /// The app became active again (scenePhase != background): a pause whose
-    /// interruption ended too early to take the microphone back gets another
-    /// try now (upstream's appBecameActive). Called by AppModel.
+    /// The app became active again: retry any deferred audio recovery and
+    /// restart live captions, without stopping the open recording file.
     func appBecameActive() {
-        guard resumeWhenActive, isRecording, paused else { return }
-        do { try resume() }
-        catch {
-            debugLog("recorder: resume on activation failed: \(error.localizedDescription)")
-            // The audio is not coming back: keep the promise honest — the
-            // partial recording is finalized instead of "recording" forever.
-            recordingLost("The microphone could not be recovered after the interruption, so the recording was stopped. The audio up to that point is saved.")
+        appInBackground = false
+        guard isRecording, !held else { return }
+        do {
+            if engineRecoveryPending {
+                try rebuildEngine()
+            } else if resumeWhenActive || paused || !(engine?.isRunning ?? false) {
+                try resume()
+            }
+            resumeRecognitionIfNeeded()
+        } catch {
+            // A transient activation failure should not close the CAF or deactivate
+            // the session; leave an explicit paused state for the next retry/Stop.
+            paused = true
+            resumeWhenActive = true
+            debugLog("recorder: resume on activation deferred: \(error.localizedDescription)")
         }
     }
 
@@ -441,7 +545,9 @@ final class Recorder: NSObject, ObservableObject {
             DispatchQueue.main.async { self.level = v }
             gate(ch, frames: Int(cap.frameLength))
         }
+        recognitionLock.lock()
         request?.append(cap)
+        recognitionLock.unlock()
         // Flush discipline, stated honestly: AVAudioFile offers no explicit
         // flush API, and none is needed for this sink — each write(from:) goes
         // through ExtAudioFile's convert-then-write, and for LinearPCM CAF the
@@ -520,12 +626,19 @@ final class Recorder: NSObject, ObservableObject {
 
     func stop() -> URL? {
         // Recognition callbacks can arrive after cancel (even during the next meeting).
+        recognitionLock.lock()
         recognitionGeneration = UUID()
+        let oldRequest = request
+        request = nil
+        let oldTask = task
+        task = nil
+        recognitionLock.unlock()
         timer?.invalidate(); timer = nil
         observers.forEach(NotificationCenter.default.removeObserver); observers = []
         engine?.inputNode.removeTap(onBus: 0); engine?.stop(); engine = nil; converter = nil
-        held = false; resumeWhenActive = false
-        request?.endAudio(); task?.cancel(); request = nil; task = nil; recognizer = nil
+        held = false; resumeWhenActive = false; engineRecoveryPending = false
+        appInBackground = false; recognitionSuspended = false
+        oldRequest?.endAudio(); oldTask?.cancel(); recognizer = nil
         // recognitionError stays readable until stopRecording() (AppModel)
         // moves it onto the session as liveCaptionNote; start() clears it.
         // A voice still open when Stop was tapped is a segment too (its pause never came).

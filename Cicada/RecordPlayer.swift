@@ -31,9 +31,10 @@ final class RecordPlayer: ObservableObject {
     /// The session's recording; another session's replaces it (the detail page
     /// is reused when another record is picked).
     func load(store: SessionStore, session: Session) {
-        guard loaded != session.id else { return }
+        let key = session.id + ":" + (session.audioFile ?? "")
+        guard loaded != key else { return }
         stop()
-        loaded = session.id
+        loaded = key
         audio = nil
         now = 0
         duration = 0
