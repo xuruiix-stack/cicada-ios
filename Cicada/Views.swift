@@ -68,6 +68,7 @@ final class AppModel: ObservableObject {
     }
     private var pendingSegs: [PendingSeg] = []
     private var cumulativeFallbackCaptions: [String: String] = [:]
+    private var cumulativeFallbackSessions: Set<String> = []
     /// `true` while the model is known missing/unloadable: skip the per-segment embedding
     /// work from then on (graceful degradation — every line keeps speaker 1).
     private var voiceprintsUnavailable = false
@@ -400,6 +401,7 @@ final class AppModel: ObservableObject {
         let live = recorder.liveText; recorder.liveText = ""
         if !live.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             cumulativeFallbackCaptions[id] = live
+            cumulativeFallbackSessions.insert(id)
             if s.lines.isEmpty {
                 s.lines = [TranscriptLine(t: 0, speaker: 1, src: live)]
             }
