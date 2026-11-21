@@ -20,6 +20,38 @@ struct RecordRefiner {
         let provisional: Range<Int>
     }
 
+    /// Keep the recording's segment identity (including an unknown short reply) while
+    /// replacing its captions. The final segment's START is not the recording's duration.
+    static func refine(_ text: String, onto lines: [TranscriptLine], duration: Double) -> [TranscriptLine] {
+        let record = Array(text)
+        guard !record.isEmpty, !lines.isEmpty else { return lines }
+        let lastStart = max(0, lines.last?.t ?? 0)
+        let total = max(duration.isFinite ? duration : 0, lastStart + 0.1, 0.1)
+        func offset(_ time: Double) -> Int {
+            let fraction = time.isFinite ? min(1, max(0, time / total)) : 0
+            return min(record.count, max(0, Int(Double(record.count) * fraction)))
+        }
+        let segments = lines.indices.map { i -> Segment in
+            let a = offset(lines[i].t)
+            let b = i + 1 < lines.count ? offset(lines[i + 1].t) : record.count
+            return Segment(text: lines[i].src, provisional: a..<max(a, b))
+        }
+        let boundaries = ends(segments: segments, record: record)
+        var out = lines
+        var from = 0
+        for i in out.indices {
+            let end = i == out.count - 1 ? record.count : boundaries[i]
+            let to = min(record.count, max(from, end))
+            let replacement = String(record[from..<to]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if replacement != out[i].src { out[i].dst = nil }
+            out[i].src = replacement
+            from = to
+        }
+        // Never restore a caption into an empty range: its words may already belong to
+        // another range, which used to duplicate text at a speaker boundary.
+        return out
+    }
+
     /// Where each segment's part of `record` ends (monotonic character offsets; the last
     /// segment ends at the record's end). A segment with caption text ends where that
     /// text ends in the record; one without ends at its provisional share.

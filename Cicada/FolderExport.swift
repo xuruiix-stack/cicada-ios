@@ -127,6 +127,19 @@ enum FolderSettings {
     /// Record id → the file name Cicada wrote for it (the index the contract
     /// keeps "next to the records"; on iOS the UserDefaults entry stands in).
     static let filesKey = "export.folderFiles"
+    /// Only record IDs: failed writes are retried without storing any transcript or key.
+    static let pendingKey = "export.folderPending"
+
+    static var pendingIDs: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: pendingKey) ?? []) }
+        set { UserDefaults.standard.set(newValue.sorted(), forKey: pendingKey) }
+    }
+
+    static func setPending(_ pending: Bool, for id: String) {
+        var ids = pendingIDs
+        if pending { ids.insert(id) } else { ids.remove(id) }
+        pendingIDs = ids
+    }
 
     static var bookmark: Data? {
         get { UserDefaults.standard.data(forKey: bookmarkKey) }
@@ -153,10 +166,22 @@ enum FolderSettings {
         UserDefaults.standard.set(files, forKey: filesKey)
     }
 
-    /// The whole index goes when a new folder is chosen: files in the old one
+    /// Commit only after bookmark creation succeeds. Re-authorizing the same
+    /// normalized Files URL preserves failed jobs and ownership of existing files.
+    /// A changed provider/container path is a new folder; do not guess aliases.
+    static func choseFolder(_ url: URL, bookmark data: Data) {
+        let sameFolder = !folderPath.isEmpty && url.isFileURL
+            && URL(fileURLWithPath: folderPath).standardizedFileURL.path == url.standardizedFileURL.path
+        bookmark = data
+        folderPath = url.path
+        if !sameFolder { resetFiles() }
+    }
+
+    /// The whole index goes when a different folder is chosen: files in the old one
     /// stay (the contract's rule), but they are no longer ours to track.
     static func resetFiles() {
         UserDefaults.standard.removeObject(forKey: filesKey)
+        UserDefaults.standard.removeObject(forKey: pendingKey)
     }
 }
 
@@ -178,9 +203,9 @@ final class FolderExporter: ObservableObject {
         return URL(fileURLWithPath: p).lastPathComponent
     }
 
-    /// A new folder was picked (document picker): store its bookmark and start
-    /// a fresh index. The picker's URL grant dies with the picker; the
-    /// bookmark is what persists it.
+    /// A folder was picked: create its bookmark before replacing settings.
+    /// Re-authorizing the same path keeps pending writes and file ownership;
+    /// choosing a different path starts a fresh index.
     func choose(_ url: URL) {
         stopAccess()
         let scoped = url // document-picker URLs are already security-scoped
@@ -191,9 +216,7 @@ final class FolderExporter: ObservableObject {
             // options (.withSecurityScope is macOS-only and does not compile here).
             // lose the user's grant across launches).
             let data = try scoped.bookmarkData(options: [])
-            FolderSettings.bookmark = data
-            FolderSettings.folderPath = url.path
-            FolderSettings.resetFiles()
+            FolderSettings.choseFolder(url, bookmark: data)
             lastSurfaced = nil
             debugLog("folder export: chose \(url.path)")
         } catch {
@@ -260,12 +283,34 @@ final class FolderExporter: ObservableObject {
         return url
     }
 
-    /// Write one session's Markdown into the chosen folder. Called at the end
-    /// of a successful pipeline; every failure path ends in debugLog + one
-    /// surfaced message and returns — the pipeline's result on the session is
-    /// already saved and is never touched by this.
-    func write(_ s: Session) {
+    /// Retry only failed/pending writes, never every historical record. A record
+    /// still processing waits for its final save; a deleted record leaves the queue.
+    func retryPending(sessions: [Session]) {
         guard FolderSettings.hasFolder else { return }
+        for id in FolderSettings.pendingIDs.sorted() {
+            guard let s = sessions.first(where: { $0.id == id }) else {
+                FolderSettings.setPending(false, for: id)
+                continue
+            }
+            guard s.endedAt != nil, s.processingState != .running,
+                  s.lines.contains(where: { !$0.src.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else { continue }
+            write(s)
+        }
+    }
+
+    /// Mark an ended meeting before any asynchronous work, even when its text
+    /// is not ready yet. A later retry waits for usable text; this stores only its ID.
+    func markPending(_ s: Session) {
+        guard FolderSettings.hasFolder, s.endedAt != nil else { return }
+        FolderSettings.setPending(true, for: s.id)
+    }
+
+    /// Write a saved session's Markdown. Queue before resolving the folder so
+    /// a lost grant or interrupted write survives a relaunch; only success dequeues.
+    /// Export never changes the session's processing result.
+    func write(_ s: Session) {
+        guard FolderSettings.hasFolder, s.endedAt != nil else { return }
+        markPending(s)
         guard let folder = resolveFolder() else { stopAccess(); return }
         defer { stopAccess() }
         do {
@@ -281,6 +326,7 @@ final class FolderExporter: ObservableObject {
             let text = FolderExportFormat.document(s)
             try Data(text.utf8).write(to: url, options: .atomic)
             FolderSettings.setFileName(name, for: s.id)
+            FolderSettings.setPending(false, for: s.id)
             // A rename moved the file: the old one goes, only if it is the one
             // Cicada wrote (the index says so).
             if let old, old != name {

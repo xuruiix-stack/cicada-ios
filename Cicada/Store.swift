@@ -81,6 +81,15 @@ final class SessionStore: ObservableObject {
     }
     func audioURL(for s: Session) -> URL? { s.audioFile.map { audioDir.appendingPathComponent($0) } }
 
+    /// Re-transcription is explicitly destructive only after a complete new transcript
+    /// arrives. Keep the old record (including names/notes) outside load()'s JSON folder.
+    func backupBeforeRetranscription(_ s: Session) throws {
+        let backups = dir.appendingPathComponent("Backups", isDirectory: true)
+        try FileManager.default.createDirectory(at: backups, withIntermediateDirectories: true)
+        let file = backups.appendingPathComponent("\(s.id)-\(UUID().uuidString).json")
+        try JSONEncoder().encode(s).write(to: file, options: .atomic)
+    }
+
     /// Speaker separation (SpeakerID.swift): a line counts towards its voice's number only
     /// when substantive. Original rule (speakers.py substantive/_cjk): >=3 words, or >=4 CJK chars.
     static func substantive(_ text: String) -> Bool {

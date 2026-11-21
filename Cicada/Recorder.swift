@@ -60,6 +60,7 @@ final class Recorder: NSObject, ObservableObject {
     private var recognizer: SFSpeechRecognizer?
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
+    private var recognitionGeneration = UUID()
     /// Mic tap (hardware rate, mono) → 16 kHz mono the file and recognizer consume.
     private var converter: AVAudioConverter?
     private let sinkFormat = AVAudioFormat(standardFormatWithSampleRate: CicadaTuning.sampleRate, channels: 1)!
@@ -72,6 +73,7 @@ final class Recorder: NSObject, ObservableObject {
     private var segSamples: [Float] = []  // the open segment's 16 kHz audio
     private var silence = 0.0             // seconds of quiet since the last voiced chunk
     private var voicedInSeg = 0.0         // voiced seconds; a segment needs some to count
+    private var capturedFrames = 0         // file/sample clock, excluding call interruptions
 
     func requestPermissions() async -> Bool {
         let mic: Bool = await withCheckedContinuation { continuation in
@@ -85,8 +87,10 @@ final class Recorder: NSObject, ObservableObject {
         return mic && speech == .authorized
     }
 
-    func start(audioURL: URL, locale: String = "en-US") throws {
+    func start(audioURL: URL, locale: String = Locale.preferredLanguages.first ?? Locale.current.identifier) throws {
         stop()
+        liveText = ""
+        timedWords = []
         // Mic capture needs a session category that allows recording; without it the
         // engine runs but the input node delivers silence (the original app's pattern).
         let session = AVAudioSession.sharedInstance()
@@ -130,7 +134,7 @@ final class Recorder: NSObject, ObservableObject {
         }
         converter = conv
         gateLock.lock()
-        inVoice = false; segSamples = []; silence = 0; voicedInSeg = 0
+        inVoice = false; segSamples = []; silence = 0; voicedInSeg = 0; capturedFrames = 0
         gateLock.unlock()
         voiceSegments = []
         input.installTap(onBus: 0, bufferSize: 4096, format: tapFmt) { [weak self] buffer, _ in
@@ -166,15 +170,17 @@ final class Recorder: NSObject, ObservableObject {
             let req = SFSpeechAudioBufferRecognitionRequest()
             req.shouldReportPartialResults = true; req.requiresOnDeviceRecognition = true
             request = req
+            let generation = recognitionGeneration
             task = rec.recognitionTask(with: req) { [weak self] result, err in
                 if let r = result {
                     DispatchQueue.main.async {
-                        self?.liveText = r.bestTranscription.formattedString
+                        guard let self, self.recognitionGeneration == generation else { return }
+                        self.liveText = r.bestTranscription.formattedString
                         // Word timestamps for the segment captions (speaker separation):
                         // SFTranscription's timestamps run on the recognizer's own clock,
                         // which starts when the request was made — the same moment as
                         // `startedAt`, so they read as recording time directly.
-                        self?.timedWords = r.bestTranscription.segments.map {
+                        self.timedWords = r.bestTranscription.segments.map {
                             (mid: $0.timestamp + $0.duration / 2, text: String($0.substring))
                         }
                     }
@@ -187,7 +193,7 @@ final class Recorder: NSObject, ObservableObject {
                 // delivers an error on cancel; code 216 in its own domain).
                 if let e = err, !Self.isCancellation(e) {
                     DispatchQueue.main.async {
-                        guard let self else { return }
+                        guard let self, self.recognitionGeneration == generation else { return }
                         guard self.recognitionError == nil else { return }
                         // With requiresOnDeviceRecognition, an error before any
                         // result at all is, in practice, the on-device model for
@@ -468,13 +474,15 @@ final class Recorder: NSObject, ObservableObject {
         for i in 0..<frames where abs(ch[i]) > CicadaTuning.gateThreshold { loud += 1 }
         let voiced = Double(loud) / Double(frames) > 0.5
         gateLock.lock(); defer { gateLock.unlock() }
+        let chunkStart = Double(capturedFrames) / CicadaTuning.sampleRate
+        capturedFrames += frames
         if voiced {
             if !inVoice {
                 inVoice = true
-                segStart = Date().timeIntervalSince(startedAt) - CicadaTuning.preRoll
+                // Use the file clock, not wall time: a phone call pauses PCM capture,
+                // and that silent wall-time gap does not exist in the saved recording.
+                segStart = chunkStart
                 silence = 0
-                // The pre-roll audio is gone (the gate opens after it passed); the segment
-                // starts empty and this chunk begins it. Voiceprints tolerate the 150 ms.
             }
             silence = 0
             voicedInSeg += seconds
@@ -511,6 +519,8 @@ final class Recorder: NSObject, ObservableObject {
     }
 
     func stop() -> URL? {
+        // Recognition callbacks can arrive after cancel (even during the next meeting).
+        recognitionGeneration = UUID()
         timer?.invalidate(); timer = nil
         observers.forEach(NotificationCenter.default.removeObserver); observers = []
         engine?.inputNode.removeTap(onBus: 0); engine?.stop(); engine = nil; converter = nil

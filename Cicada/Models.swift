@@ -89,6 +89,23 @@ struct Session: Identifiable, Codable, Equatable {
 }
 
 extension Session {
+    /// Short acknowledgements may suggest a voice, but do not authorize naming it.
+    /// A one-to-one meeting can name its one substantive voice without inventing S2.
+    func canNameVoice(_ voice: Int) -> Bool {
+        let matching = lines.filter { $0.voice == voice }
+        return matching.contains { $0.speakerName?.isEmpty == false }
+            || matching.filter { SessionStore.substantive($0.src) }.count >= CicadaTuning.shownAfter
+    }
+
+    mutating func nameVoice(_ voice: Int, name: String) {
+        guard canNameVoice(voice) else { return }
+        let cleaned = String(name.split(whereSeparator: { $0.isNewline }).joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines).prefix(80))
+        for i in lines.indices where lines[i].voice == voice {
+            lines[i].speakerName = cleaned.isEmpty ? nil : cleaned
+        }
+    }
+
     enum CodingKeys: String, CodingKey {
         case id, title, startedAt, endedAt, lines, notes, audioFile
         case processingState, transcribed, lastError, liveCaptionNote, failedChunkCount

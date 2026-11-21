@@ -174,8 +174,9 @@ final class AIClient: ObservableObject {
         var key: String? {
             switch self {
             case .main: return Keychain.string(for: AISettings.keyKey)
-            // Upstream's rule: the notes key when one was saved, else the main key.
-            case .notes: return AISettings.notesKeyOrMain
+            // A model-only override shares the main service's key. A saved notes
+            // key belongs to its own address, not to a later model-only setup.
+            case .notes: return AISettings.notesApart ? AISettings.notesKeyOrMain : Keychain.string(for: AISettings.keyKey)
             }
         }
         var chatModel: String {
@@ -627,11 +628,11 @@ final class AIClient: ObservableObject {
     }
 
     /// Structured meeting notes: summary, topics, conclusions, action items.
-    /// Sent through the notes service when one is configured (upstream
-    /// v1.9.0's 纪要另一个服务), else the main service exactly as before —
-    /// same machinery either way, so the errors name the host that answered.
+    /// Always resolve the notes side: a model alone overrides the main model,
+    /// while an empty address/key/model falls back to the main service.
+    /// Errors name the host that actually answered.
     func meetingNotes(transcript: String) async throws -> MeetingNotes {
-        let side: Side = AISettings.notesApart ? .notes : .main
+        let side: Side = .notes
         let raw = try await chat(
             system: "You write structured meeting notes. Reply with JSON only: {\"summary\":string,\"topics\":[{\"title\":string,\"points\":[string]}],\"conclusions\":[string],\"actionItems\":[{\"text\":string,\"owner\":string|null}]}",
             user: transcript, json: true, on: side)

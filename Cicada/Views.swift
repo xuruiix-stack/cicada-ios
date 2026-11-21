@@ -37,6 +37,7 @@ final class AppModel: ObservableObject {
     /// `busy`, which runPipeline sets after its first await — too late to close
     /// the overlap race between two process() calls).
     private var pipelineActive = false
+    private var startingRecording = false
 
     private var subs = Set<AnyCancellable>()
     /// Speaker separation: the voiceprint engine (SpeakerID.swift). Segments' audio is
@@ -189,7 +190,9 @@ final class AppModel: ObservableObject {
         NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification,
                                                object: nil, queue: .main) { [weak self] _ in
             self?.recorder.appBecameActive()
+            if let self { self.exporter.retryPending(sessions: self.store.sessions) }
         }
+        exporter.retryPending(sessions: store.sessions)
         startNetworkMonitor()
     }
 
@@ -255,7 +258,7 @@ final class AppModel: ObservableObject {
         guard recordingId == nil, !recorder.isRecording else { return }
         // If a pipeline is already running, the user beat us to ↻ — don't
         // queue a second one behind it (process() would drop it anyway).
-        guard !pipelineActive else { return }
+        guard !pipelineActive, !busy, !startingRecording else { return }
         guard AISettings.isConfigured else { return }
         // Mark them all up front: a later re-entrant call (the monitor can
         // fire more than once per window) must not double-book a session.
@@ -304,6 +307,9 @@ final class AppModel: ObservableObject {
     }
 
     func startRecording() async {
+        guard !busy, !pipelineActive, !startingRecording, recordingId == nil, !recorder.isRecording else { return }
+        startingRecording = true
+        defer { startingRecording = false }
         message = nil
         guard await recorder.requestPermissions() else {
             message = "Microphone / speech permission denied. Enable the microphone in Settings › Privacy › Microphone."
@@ -356,16 +362,17 @@ final class AppModel: ObservableObject {
         s.liveCaptionNote = recorder.recognitionError
         recorder.recognitionError = nil
         store.save(s)
+        exporter.markPending(s)
         selection = s.id
         // Speaker separation first, then the pipeline: applySpeakers groups the voices
         // heard in this recording and lays the transcript over the segments, and the
         // pipeline's server transcription must not race it. process() is async and
         // sets `busy`, so this returns immediately and Stop stays responsive. Both run
         // under the same Task so their saves stay ordered.
-        Task {
-            await self.applySpeakers(s)
-            await self.process(s)
-        }
+        // Close the Record/retry window before the Task first suspends: otherwise a new
+        // recording can reset pendingSegs while this one's embeddings are still settling.
+        busy = true
+        Task { await self.process(s, useRecordingSegments: true) }
     }
 
     /// Speaker separation at stop: cluster the segments' voiceprints in recording order
@@ -430,52 +437,52 @@ final class AppModel: ObservableObject {
         store.save(session)
     }
 
-    /// The server transcript laid over the segment lines: each line keeps its time and
-    /// voice and gets the words said in it (RecordRefiner's edit-distance alignment,
-    /// bounded window per segment). Lines whose caption text was too short to align get
-    /// their proportional share of the transcript by speaking time.
-    private func refineTranscript(_ text: String, onto lines: [TranscriptLine]) -> [TranscriptLine] {
-        let record = Array(text)
-        guard !record.isEmpty, !lines.isEmpty else { return lines }
-        // Each line's provisional range: its start's share of the transcript, plus
-        // one segment's worth (8 s). The alignment moves the boundaries; this only
-        // bounds its windows and backs up the lines with no caption text.
-        let total = max(lines.last?.t ?? 0, 1)
-        var segs: [RecordRefiner.Segment] = []
-        for l in lines {
-            let a = Int(Double(record.count) * max(0, l.t) / total)
-            let b = min(record.count, Int(Double(record.count) * min(1, (l.t + 8) / total)))
-            segs.append(RecordRefiner.Segment(text: l.src, provisional: a..<max(a, b)))
-        }
-        let ends = RecordRefiner.ends(segments: segs, record: record)
-        var out = lines
-        var from = 0
-        for i in out.indices {
-            let to = i == out.count - 1 ? record.count : (i < ends.count ? ends[i] : record.count)
-            out[i].src = String(record[from..<max(from, to)]).trimmingCharacters(in: .whitespacesAndNewlines)
-            from = max(from, to)
-        }
-        // A line the alignment left with no text (all its words went to a neighbour)
-        // keeps its caption rather than showing empty.
-        for i in out.indices where out[i].src.isEmpty { out[i].src = lines[i].src }
-        return out
-    }
-
     /// AI pipeline for a finished recording: transcribe → translate → notes.
     /// Wraps runPipeline(_:) in a UIApplication background task so the pipeline
     /// can finish after the user locks the screen or switches away; every caller
     /// (Stop and the manual ↻ button) gets the background protection.
-    func process(_ s: Session) async {
-        // Serialize: two pipelines at once (stop a second recording while the
-        // first still processes) would interleave saves on the two sessions.
-        // The dropped run leaves the session's persisted state as-is, so the
-        // Notes tab shows the honest hint / error and ↻ retries.
-        guard !pipelineActive else {
-            message = "Still processing the previous recording — try again in a moment."
+    func process(_ s: Session, retranscribe: Bool = false, useRecordingSegments: Bool = false) async {
+        guard !pipelineActive, !startingRecording, !recorder.isRecording else {
+            message = "Still recording or processing — try again in a moment."
             return
         }
         pipelineActive = true
-        defer { pipelineActive = false }
+        busy = true
+        var taskID: UIBackgroundTaskIdentifier = .invalid
+        defer {
+            pipelineActive = false
+            busy = false
+            // Include local-caption-only, failed and interrupted runs. Export failure
+            // queues a retry in FolderExporter; it never changes the pipeline result.
+            if let latest = store.sessions.first(where: { $0.id == s.id }),
+               latest.lines.contains(where: { !$0.src.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
+                exporter.write(latest)
+            }
+            // Keep the background grant until AFTER the final write/persistent queue update.
+            if backgroundTaskId == taskID {
+                backgroundTaskId = .invalid
+                if taskID != .invalid { UIApplication.shared.endBackgroundTask(taskID) }
+            }
+        }
+        // Session is a value type. The caller may hold a snapshot from before the
+        // speaker pass (or a previous refresh); never save that snapshot over the store.
+        guard var current = store.sessions.first(where: { $0.id == s.id }) else { return }
+        exporter.markPending(current)
+        if retranscribe {
+            guard AISettings.isConfigured else {
+                message = "Set the transcription service URL and key before re-transcribing. Nothing was replaced."
+                return
+            }
+            guard let url = store.audioURL(for: current), Recorder.audioSeconds(at: url) > 0 else {
+                message = "The saved recording is missing or unreadable. The existing transcript and notes were kept."
+                return
+            }
+            do { try store.backupBeforeRetranscription(current) }
+            catch {
+                message = "Could not back up this meeting. Nothing was replaced: \(error.localizedDescription)"
+                return
+            }
+        }
         let id = UIApplication.shared.beginBackgroundTask(withName: "cicada-pipeline") { [weak self] in
             // Expiration: iOS grants no more background time and runs this on a
             // background thread. Hop to the main actor and set the cancel flag;
@@ -486,12 +493,20 @@ final class AppModel: ObservableObject {
             Task { @MainActor in self?.pipelineCancelled = true }
         }
         backgroundTaskId = id
+        taskID = id
         pipelineCancelled = false
-        await runPipeline(s)
-        if backgroundTaskId == id {
-            backgroundTaskId = .invalid
-            if id != .invalid { UIApplication.shared.endBackgroundTask(id) }
+        if useRecordingSegments {
+            await applySpeakers(current)
+            guard let latest = store.sessions.first(where: { $0.id == s.id }) else { return }
+            current = latest
         }
+        if pipelineCancelled {
+            current.processingState = .failed
+            current.lastError = "Processing was interrupted."
+            store.save(current)
+            return
+        }
+        await runPipeline(current, retranscribe: retranscribe)
     }
 
     /// The pipeline, restructured after the "real transcript but no notes" bug:
@@ -503,9 +518,12 @@ final class AppModel: ObservableObject {
     /// task, so it keeps running briefly after the user leaves the app. Its
     /// expiration handler sets pipelineCancelled; this function checks that flag
     /// at each step boundary and saves the partial progress reached so far.
-    func runPipeline(_ s: Session) async {
-        busy = true; defer { busy = false }
-        guard AISettings.isConfigured else { message = "Set the API base URL and key in Settings › AI Service."; return }
+    private func runPipeline(_ s: Session, retranscribe: Bool) async {
+        let hasText = s.lines.contains { !$0.src.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard AISettings.isConfigured || (!retranscribe && hasText && AIClient.Side.notes.isConfigured) else {
+            message = "Set the API base URL and key in Settings › AI Service."
+            return
+        }
         var s = s
         var errors: [String] = []
         s.processingState = .running
@@ -517,7 +535,8 @@ final class AppModel: ObservableObject {
         // every audio chunk. The liveText fallback line counts as transcript text
         // for the notes step, but does not set `transcribed` — a server
         // transcription can still improve on it.
-        if !s.transcribed, let url = store.audioURL(for: s) {
+        var replacedTranscript = false
+        if AISettings.isConfigured, !s.transcribed || retranscribe, let url = store.audioURL(for: s) {
             do {
                 let text: String
                 var failedChunks = 0
@@ -527,20 +546,44 @@ final class AppModel: ObservableObject {
                 } else {
                     text = try await ai.transcribe(audioURL: url)
                 }
-                if !text.isEmpty {
-                    // Speaker separation: when the recording's segments were laid out
-                    // as lines (applySpeakers — every line has a voice or a caption),
-                    // the server transcript takes each line's place, aligned by its
-                    // caption text (RecordRefiner, upstream 4cb8512's boundary fix
-                    // included). Without segments (the model unavailable, or a
-                    // recording with no voiced audio) the whole transcript stays one
-                    // line, as before. The liveText fallback line never has a voice,
-                    // so it takes the one-line path.
-                    let segmented = s.lines.count > 1 && s.lines.allSatisfy { $0.voice != nil || !$0.src.isEmpty }
-                    s.lines = segmented ? refineTranscript(text, onto: s.lines)
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    // A partial replacement must not destroy a complete saved transcript.
+                    if retranscribe && failedChunks > 0 {
+                        throw NSError(domain: "Cicada", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                            "\(failedChunks) audio chunk(s) failed. The existing transcript and notes were kept."])
+                    }
+                    var segments = retranscribe ? [] : s.lines
+                    // Recover voices from the FILE after a relaunch/offline failure. In-memory
+                    // gate/caption state is not available then. A fresh re-transcription also
+                    // gets a fresh voice namespace; old names must not label new clusters.
+                    if retranscribe || !segments.contains(where: { $0.voice != nil }) {
+                        do {
+                            let recovered = try await speakers.lines(in: url)
+                            if !recovered.isEmpty { segments = recovered }
+                        } catch {
+                            if retranscribe { throw error }
+                            errors.append("Speaker separation failed: \(error.localizedDescription)")
+                        }
+                    }
+                    if pipelineCancelled { throw CancellationError() }
+                    // Empty text / a nil voice is a valid short unknown reply, not a reason
+                    // to collapse every other segment into one line (upstream ab787d4).
+                    let segmented = segments.count > 1 || segments.contains(where: { $0.voice != nil })
+                    let seconds = Recorder.audioSeconds(at: url)
+                    var replacement = segmented
+                        ? RecordRefiner.refine(text, onto: segments, duration: seconds)
                         : [TranscriptLine(t: 0, speaker: 1, src: text)]
+                    let numbers = SpeakerLabels.voiceNumbers(replacement)
+                    for i in replacement.indices {
+                        if let voice = replacement[i].voice, let number = numbers[voice] {
+                            replacement[i].speaker = number
+                        }
+                    }
+                    s.lines = replacement
+                    s.notes = nil
                     s.transcribed = true
                     s.failedChunkCount = failedChunks
+                    replacedTranscript = true
                     // Persist the transcript immediately: if translate or notes
                     // fails below, the transcript is still on the session.
                     store.save(s)
@@ -558,6 +601,13 @@ final class AppModel: ObservableObject {
                 }
             } catch { errors.append("Transcription failed: \(error.localizedDescription)") }
         }
+        if retranscribe && !replacedTranscript {
+            s.processingState = .failed
+            s.lastError = errors.isEmpty ? "No new transcript was returned. The existing transcript and notes were kept." : errors.joined(separator: " · ")
+            store.save(s)
+            message = s.lastError
+            return
+        }
         if pipelineCancelled {
             s.processingState = .failed
             s.lastError = errors.isEmpty ? "Processing was interrupted." : errors.joined(separator: " · ")
@@ -568,8 +618,8 @@ final class AppModel: ObservableObject {
         // translation entirely: no dst values are set (TranscriptRow hides dst
         // when nil) and notes are generated from the original-language lines.
         // A translate failure must not stop notes: the line keeps its src text.
-        if AISettings.simultaneousInterpretation && !s.lines.isEmpty && AISettings.targetLang != "auto" {
-            for i in s.lines.indices {
+        if AISettings.isConfigured && AISettings.simultaneousInterpretation && !s.lines.isEmpty && AISettings.targetLang != "auto" {
+            for i in s.lines.indices where !s.lines[i].src.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 do { s.lines[i].dst = try await ai.translate(s.lines[i].src, to: AISettings.targetLang) }
                 catch { errors.append("Translation failed: \(error.localizedDescription)"); break }
             }
@@ -586,9 +636,10 @@ final class AppModel: ObservableObject {
         // does not skip it. Speaker labels match the transcript rows: an
         // unidentified voice is "Unknown", not a false "Speaker 1".
         let numbers = SpeakerLabels.voiceNumbers(s.lines)
-        let transcript = s.lines.map { l -> String in
+        let transcript = s.lines.filter { !$0.src.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.map { l -> String in
             let who: String
-            if let v = l.voice, let n = numbers[v] { who = "Speaker \(n)" }
+            if let name = l.speakerName, !name.isEmpty { who = name }
+            else if let v = l.voice, let n = numbers[v] { who = "Speaker \(n)" }
             else if numbers.isEmpty { who = "Speaker \(l.speaker)" }
             else { who = "Unknown" }
             return "\(who): \(l.src)"
@@ -604,12 +655,16 @@ final class AppModel: ObservableObject {
         s.processingState = (s.lastError == nil) ? .done : .failed
         store.save(s)
         if let e = s.lastError { message = e }
-        // Auto-save Markdown (item 3): once the transcript + notes are saved on
-        // the session, its Markdown goes into the user's chosen folder. Strictly
-        // after the final save, and its own do/catch: a stale bookmark or a write
-        // error is logged and surfaced by the exporter, never a pipeline failure
-        // or a block on the session that just finished. No folder chosen: nothing.
-        if !s.lines.isEmpty { exporter.write(s) }
+        // process() exports the latest saved state in defer, including early exits.
+    }
+
+    func nameSpeaker(in session: Session, voice: Int, name: String) {
+        guard !busy, !recorder.isRecording,
+              var current = store.sessions.first(where: { $0.id == session.id }),
+              current.canNameVoice(voice) else { return }
+        current.nameVoice(voice, name: name)
+        store.save(current)
+        exporter.write(current)
     }
 
     func exportMarkdown(_ s: Session) -> String { TranscriptExport.markdown(s) }
@@ -699,7 +754,7 @@ struct RecordsList: View {
                             Image(systemName: "mic.fill").font(.title2)
                                 .foregroundStyle(.white).frame(width: 52, height: 52)
                                 .background(Ink.accent, in: Circle())
-                        }
+                        }.disabled(model.busy)
                     }
                 }
                 .padding(.vertical, 4)
@@ -713,7 +768,12 @@ struct RecordsList: View {
                         }
                     }
                 }
-                .onDelete { if let i = $0.first, i < model.store.sessions.count { model.store.delete(model.store.sessions[i]); model.selection = nil } }
+                .onDelete {
+                    guard !model.busy, !model.recorder.isRecording else { return }
+                    if let i = $0.first, i < model.store.sessions.count {
+                        model.store.delete(model.store.sessions[i]); model.selection = nil
+                    }
+                }
             }
         }
         .listStyle(.insetGrouped)
@@ -731,6 +791,20 @@ struct RecordDetail: View {
     /// user can read elsewhere without the list fighting them (the Mac's
     /// `following` rule).
     @State private var following = true
+    @State private var namingVoice: Int?
+    @State private var speakerName = ""
+    @State private var showingName = false
+    @State private var confirmingRetranscription = false
+
+    private func nameAction(for line: TranscriptLine) -> (() -> Void)? {
+        guard !model.busy, !model.recorder.isRecording,
+              let voice = line.voice, session.canNameVoice(voice) else { return nil }
+        return {
+            namingVoice = voice
+            speakerName = line.speakerName ?? ""
+            showingName = true
+        }
+    }
 
     var body: some View {
         // The line at the playback position (the official app's lineID, +0.2 s
@@ -757,7 +831,8 @@ struct RecordDetail: View {
                         // them here once instead of per row.
                         let numbers = SpeakerLabels.voiceNumbers(session.lines)
                         ForEach(session.lines) { l in
-                            TranscriptRow(line: l, numbers: numbers, playing: l.id == playing)
+                            TranscriptRow(line: l, numbers: numbers, playing: l.id == playing,
+                                          onName: nameAction(for: l))
                                 .id(l.id)
                                 // Tapping a line starts playback from its timestamp
                                 // (the official app's seek-on-line-tap).
@@ -819,13 +894,40 @@ struct RecordDetail: View {
                     Button { model.selection = nil } label: {
                         Image(systemName: "chevron.left")
                     }
-                    Button { Task { await model.process(session) } } label: {
+                    Menu {
+                        Button("Retry processing / regenerate notes") {
+                            Task { await model.process(session) }
+                        }
+                        Button("Transcribe Again…", role: .destructive) {
+                            player.stop()
+                            confirmingRetranscription = true
+                        }.disabled(session.audioFile == nil)
+                    } label: {
                         model.busy ? AnyView(ProgressView()) : AnyView(Image(systemName: "arrow.triangle.2.circlepath"))
                     }.disabled(model.busy || model.recorder.isRecording)
                     ShareLink(item: model.exportMarkdown(session), subject: Text(TranscriptExport.displayTitle(session))) {
                         Image(systemName: "square.and.arrow.up")
                     }
                 }
+            }
+            .alert("Name this speaker", isPresented: $showingName) {
+                TextField("Name (blank to clear)", text: $speakerName)
+                Button("Save") {
+                    if let voice = namingVoice { model.nameSpeaker(in: session, voice: voice, name: speakerName) }
+                    namingVoice = nil
+                }
+                Button("Cancel", role: .cancel) { namingVoice = nil }
+            } message: {
+                Text("Applies to this voice in this meeting only. Voices are not remembered across meetings.")
+            }
+            .confirmationDialog("Transcribe this recording again?", isPresented: $confirmingRetranscription,
+                                titleVisibility: .visible) {
+                Button("Transcribe Again", role: .destructive) {
+                    Task { await model.process(session, retranscribe: true) }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("A complete new transcript replaces this meeting's text, speaker names and notes. A local backup of the previous record is kept; if transcription fails, the existing content stays.")
             }
             .onAppear {
                 // The player and the recorder share one AVAudioSession: the
@@ -888,6 +990,32 @@ struct TranscriptRow: View {
     /// True when the playback position is on this line (the official app's
     /// row highlight: a light accent wash, the same 0.06 opacity as its).
     var playing: Bool = false
+    var onName: (() -> Void)?
+
+    @ViewBuilder
+    private var speakerTag: some View {
+        if let name = line.speakerName {
+            Text(name).font(.caption.bold())
+                .foregroundStyle(SpeakerInk.ink(line.speaker))
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .background(SpeakerInk.tint(line.speaker), in: Capsule())
+        } else if let v = line.voice, let n = numbers[v] {
+            Text("S\(n)").font(.caption.bold())
+                .foregroundStyle(SpeakerInk.ink(n))
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .background(SpeakerInk.tint(n), in: Capsule())
+        } else if numbers.isEmpty {
+            Text("S\(line.speaker)").font(.caption.bold())
+                .foregroundStyle(SpeakerInk.ink(line.speaker))
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .background(SpeakerInk.tint(line.speaker), in: Capsule())
+        } else {
+            Text("未识别").font(.caption.weight(.semibold))
+                .foregroundStyle(Ink.tertiary)
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .background(Ink.line.opacity(0.5), in: Capsule())
+        }
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -899,26 +1027,12 @@ struct TranscriptRow: View {
             // show: a genuine solo recording keeps its S1 on every line. The
             // branch order matches TranscriptExport.markdown, so the export and
             // the screen never disagree about who spoke.
-            if let name = line.speakerName {
-                Text(name).font(.caption.bold())
-                    .foregroundStyle(SpeakerInk.ink(line.speaker))
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                    .background(SpeakerInk.tint(line.speaker), in: Capsule())
-            } else if let v = line.voice, let n = numbers[v] {
-                Text("S\(n)").font(.caption.bold())
-                    .foregroundStyle(SpeakerInk.ink(n))
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                    .background(SpeakerInk.tint(n), in: Capsule())
-            } else if numbers.isEmpty {
-                Text("S\(line.speaker)").font(.caption.bold())
-                    .foregroundStyle(SpeakerInk.ink(line.speaker))
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                    .background(SpeakerInk.tint(line.speaker), in: Capsule())
+            if let onName {
+                Button(action: onName) { speakerTag }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Name this speaker")
             } else {
-                Text("未识别").font(.caption.weight(.semibold))
-                    .foregroundStyle(Ink.tertiary)
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                    .background(Ink.line.opacity(0.5), in: Capsule())
+                speakerTag
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text(line.src).font(.body)
@@ -951,6 +1065,10 @@ struct NotesView: View {
     var body: some View {
         if let n = notes, !n.isEmpty {
             VStack(alignment: .leading, spacing: 14) {
+                if state == .failed {
+                    Text("Last attempt failed: \(reason). The saved content below was kept.")
+                        .font(.footnote).foregroundStyle(Ink.accentText)
+                }
                 if !n.summary.isEmpty { Text(n.summary).font(.body) }
                 ForEach(n.topics, id: \.title) { t in
                     VStack(alignment: .leading, spacing: 4) {
@@ -1152,7 +1270,10 @@ struct SettingsView: View {
     /// this callback only; choose() turns it into a security-scoped
     /// bookmark, which is what persists the grant across launches.
     private func pickFolder() {
-        FolderPickerPresenter.shared.present { url in model.exporter.choose(url) }
+        FolderPickerPresenter.shared.present { url in
+            model.exporter.choose(url)
+            model.exporter.retryPending(sessions: model.store.sessions)
+        }
     }
 
     private func saveKey() {

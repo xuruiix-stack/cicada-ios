@@ -238,6 +238,90 @@ enum SpeakerLabels {
     }
 }
 
+/// The file fallback uses the same voice gate as the live recorder, but its clock is the
+/// decoded PCM, not wall time (interruptions need not be present in the recording).
+/// Only one 100 ms chunk and one bounded voice segment are retained at a time.
+private struct FileVoiceGate {
+    private static let rate = CicadaTuning.sampleRate
+    private static let chunkFrames = max(1, Int(rate * CicadaTuning.captureChunk))
+    private var chunk: [Float] = []
+    private var samples: [Float] = []
+    private var processedFrames = 0
+    private var silenceFrames = 0
+    private var start = 0.0
+
+    mutating func append(_ input: UnsafeBufferPointer<Float>, emit: (Double, [Float]) -> Void) {
+        var offset = 0
+        while offset < input.count {
+            let n = min(Self.chunkFrames - chunk.count, input.count - offset)
+            chunk.append(contentsOf: input[offset..<(offset + n)])
+            offset += n
+            if chunk.count == Self.chunkFrames { consumeChunk(emit: emit) }
+        }
+    }
+
+    mutating func finish(emit: (Double, [Float]) -> Void) {
+        if !chunk.isEmpty { consumeChunk(emit: emit) }
+        close(emit: emit)
+    }
+
+    private mutating func consumeChunk(emit: (Double, [Float]) -> Void) {
+        let loud = chunk.reduce(0) { $0 + (abs($1) > CicadaTuning.gateThreshold ? 1 : 0) }
+        if loud * 2 > chunk.count {
+            if samples.isEmpty {
+                start = max(0, Double(processedFrames) / Self.rate - CicadaTuning.preRoll)
+            }
+            silenceFrames = 0
+            samples.append(contentsOf: chunk)
+        } else if !samples.isEmpty {
+            silenceFrames += chunk.count
+        }
+        processedFrames += chunk.count
+        chunk.removeAll(keepingCapacity: true)
+        if !samples.isEmpty,
+           Double(silenceFrames) / Self.rate >= CicadaTuning.pauseEndsSegment
+            || Double(samples.count) / Self.rate >= CicadaTuning.maxSegmentLength {
+            close(emit: emit)
+        }
+    }
+
+    private mutating func close(emit: (Double, [Float]) -> Void) {
+        guard !samples.isEmpty else { return }
+        emit(start, samples)
+        samples.removeAll(keepingCapacity: true)
+        silenceFrames = 0
+    }
+}
+
+private final class FileSpeakerCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+    func check() throws {
+        lock.lock(); let value = cancelled; lock.unlock()
+        if value { throw CancellationError() }
+    }
+}
+
+private enum FileSpeakerError: LocalizedError {
+    case invalidFormat, decodeFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidFormat: return "The recording's audio format cannot be read for speaker separation."
+        case .decodeFailed: return "The recording could not be fully decoded for speaker separation."
+        }
+    }
+}
+
+/// Mutable model state belongs to the utility queue, not SpeakerTagger's main actor.
+/// The holder is only touched inside that queue's blocks.
+private final class SpeakerWorkerState: @unchecked Sendable {
+    var model: Voiceprints?
+    var loadFailed = false
+}
+
 /// Loads the voiceprint model off the main thread and computes embeddings. The upstream Mac
 /// app tags each line as it arrives (its clusterer lives here); the rebuild records a whole
 /// meeting first, so the caller holds the `VoiceClusterer` and groups the embeddings in
@@ -246,16 +330,13 @@ enum SpeakerLabels {
 @MainActor
 final class SpeakerTagger {
     private let queue = DispatchQueue(label: "com.wquguru.cicada.voiceprint", qos: .utility)
-    /// Queue-confined state (touched only inside `queue.async` blocks; Swift 5 has no
-    /// `nonisolated(unsafe)` to spell that with, so these are plain vars).
-    private var model: Voiceprints?
-    private var loadFailed = false
+    private let worker = SpeakerWorkerState()
     /// Main-thread: whether the model is known unloadable, set from a done callback once
     /// the load has settled on the queue. The caller stops embedding when it turns false.
     private(set) var available: Bool = true
 
     /// A new recording: forget the model's load failure only (the clusterer is the caller's).
-    func reset() { queue.async { [self] in loadFailed = false }; available = true }
+    func reset() { queue.async { [worker] in worker.loadFailed = false }; available = true }
 
     /// Load/compile the model NOW, off the recording's hot path (review-1 P1-2:
     /// the first voice segment used to trigger MLModel.compileModel mid-recording —
@@ -265,11 +346,11 @@ final class SpeakerTagger {
     /// here, and the first segment's embed becomes a plain inference. Failure
     /// is fine — embed() retries the load and degrades gracefully as before.
     func warmUp() {
-        queue.async { [self] in
-            if model == nil, !loadFailed {
-                do { model = try Voiceprints.load() }
+        queue.async { [worker] in
+            if worker.model == nil, !worker.loadFailed {
+                do { worker.model = try Voiceprints.load() }
                 catch {
-                    loadFailed = true
+                    worker.loadFailed = true
                     debugLog("voiceprint model failed to load: \(error)")
                 }
             }
@@ -281,15 +362,15 @@ final class SpeakerTagger {
     /// no voice yet is not "like no voice", so a pending or failed voiceprint never
     /// counts as a decision).
     func embed(_ samples: [Float], done: @escaping @MainActor ([Float]?) -> Void) {
-        queue.async { [self] in
-            if model == nil, !loadFailed {
-                do { model = try Voiceprints.load() } catch {
-                    loadFailed = true
+        queue.async { [self, worker] in
+            if worker.model == nil, !worker.loadFailed {
+                do { worker.model = try Voiceprints.load() } catch {
+                    worker.loadFailed = true
                     debugLog("voiceprint model failed to load: \(error)")
                 }
             }
-            let emb = model.flatMap { $0.embed(samples) }
-            let failed = loadFailed
+            let emb = worker.model.flatMap { $0.embed(samples) }
+            let failed = worker.loadFailed
             DispatchQueue.main.async {
                 // No MainActor.assumeIsolated here: it needs iOS 17, and the deployment
                 // target is 16.4. A dispatch to the main queue is the main actor.
@@ -304,6 +385,123 @@ final class SpeakerTagger {
     /// The same, as an await for the batch flow at stop time.
     func embed(_ samples: [Float]) async -> [Float]? {
         await withCheckedContinuation { cont in embed(samples) { cont.resume(returning: $0) } }
+    }
+
+    /// Rebuild a recording's speaker skeleton without live captions or retained raw audio.
+    /// Unknown short segments stay in the result; no identified voices means the caller
+    /// should keep its existing transcript. Read/decode failures never return partial lines.
+    func lines(in url: URL) async throws -> [TranscriptLine] {
+        let cancellation = FileSpeakerCancellation()
+        return try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[TranscriptLine], Error>) in
+                queue.async { [worker] in
+                    do {
+                        try cancellation.check()
+                        let file = try AVAudioFile(forReading: url)
+                        if worker.model == nil, !worker.loadFailed {
+                            do { worker.model = try Voiceprints.load() }
+                            catch {
+                                worker.loadFailed = true
+                                debugLog("voiceprint model failed to load: \(error)")
+                            }
+                        }
+                        try cancellation.check()
+                        guard let model = worker.model else { cont.resume(returning: []); return }
+                        let lines = try Self.fileLines(file, model: model, cancellation: cancellation)
+                        try cancellation.check()
+                        cont.resume(returning: lines)
+                    } catch { cont.resume(throwing: error) }
+                }
+            }
+        }, onCancel: { cancellation.cancel() })
+    }
+
+    /// Queue-confined: the file, VAD and clusterer belong to this job, never the live session.
+    private nonisolated static func fileLines(_ file: AVAudioFile, model: Voiceprints,
+                                              cancellation: FileSpeakerCancellation) throws -> [TranscriptLine] {
+        let source = file.processingFormat
+        guard source.sampleRate.isFinite, source.sampleRate > 0, source.channelCount > 0,
+              let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: CicadaTuning.sampleRate,
+                                         channels: 1, interleaved: false) else {
+            throw FileSpeakerError.invalidFormat
+        }
+        let frames = AVAudioFrameCount(CicadaTuning.sampleRate * CicadaTuning.captureChunk)
+        guard let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else {
+            throw FileSpeakerError.invalidFormat
+        }
+        var gate = FileVoiceGate()
+        var clusterer = VoiceClusterer()
+        var lines: [TranscriptLine] = []
+        let emit = { (t: Double, samples: [Float]) in
+            var line = TranscriptLine(t: t, src: "")
+            line.voice = model.embed(samples).flatMap {
+                clusterer.label($0, seconds: Double(samples.count) / CicadaTuning.sampleRate)
+            }
+            lines.append(line)
+        }
+        func consume() throws {
+            guard output.frameLength > 0 else { return }
+            guard let channel = output.floatChannelData?[0] else { throw FileSpeakerError.invalidFormat }
+            gate.append(UnsafeBufferPointer(start: channel, count: Int(output.frameLength)), emit: emit)
+        }
+
+        if source == format {
+            while file.framePosition < file.length {
+                try cancellation.check()
+                try file.read(into: output, frameCount: frames)
+                guard output.frameLength > 0 else { throw FileSpeakerError.decodeFailed }
+                try consume()
+            }
+        } else {
+            guard let converter = AVAudioConverter(from: source, to: format) else {
+                throw FileSpeakerError.invalidFormat
+            }
+            // Default conversion remaps channels; mix them so a right-only speaker survives.
+            if source.channelCount > 1 { converter.downmix = true }
+            // Pull small source buffers as requested by the converter, including its EOF drain.
+            // A single read/convert call can stop at a codec packet boundary; it is not EOF.
+            var noProgress = 0
+            while true {
+                try cancellation.check()
+                let before = file.framePosition
+                var readError: Error?
+                var convertError: NSError?
+                output.frameLength = 0
+                let status = converter.convert(to: output, error: &convertError) { requested, inputStatus in
+                    do {
+                        try cancellation.check()
+                        if file.framePosition >= file.length {
+                            inputStatus.pointee = .endOfStream
+                            return nil
+                        }
+                        let capacity = min(max(AVAudioFrameCount(requested), 1), 16_384)
+                        guard let input = AVAudioPCMBuffer(pcmFormat: source, frameCapacity: capacity) else {
+                            throw FileSpeakerError.invalidFormat
+                        }
+                        try file.read(into: input, frameCount: capacity)
+                        guard input.frameLength > 0 else { throw FileSpeakerError.decodeFailed }
+                        inputStatus.pointee = .haveData
+                        return input
+                    } catch {
+                        readError = error
+                        inputStatus.pointee = .endOfStream
+                        return nil
+                    }
+                }
+                if let error = readError { throw error }
+                if let error = convertError { throw error }
+                if status == .error { throw FileSpeakerError.decodeFailed }
+                try consume()
+                if status == .endOfStream { break }
+                if output.frameLength == 0, file.framePosition == before {
+                    noProgress += 1
+                    guard noProgress < 3 else { throw FileSpeakerError.decodeFailed }
+                } else { noProgress = 0 }
+            }
+        }
+        try cancellation.check()
+        gate.finish(emit: emit)
+        return lines.contains(where: { $0.voice != nil }) ? lines : []
     }
 }
 
