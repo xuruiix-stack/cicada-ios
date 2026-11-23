@@ -241,6 +241,13 @@ final class Recorder: NSObject, ObservableObject {
     private func appEnteredBackground() {
         appInBackground = true
         suspendRecognition()
+        // Lock-screen kill forensics (2026-11-22): if the app is killed within
+        // seconds of locking, these two lines say whether the engine was still
+        // running and whether the session was still ours when the screen locked.
+        // engineRunning=true in the last log before death means the audio graph
+        // was never the thing that stopped — the kill came from outside.
+        debugLog("recorder: entered background; engineRunning=\(engine?.isRunning ?? false) "
+                 + "isOtherAudioPlaying=\(!AVAudioSession.sharedInstance().isOtherAudioPlaying ? "no" : "yes")")
         guard isRecording else { return }
         if !(engine?.isRunning ?? false), !held {
             paused = true
@@ -318,6 +325,12 @@ final class Recorder: NSObject, ObservableObject {
     private func interrupted(_ n: Notification) {
         guard isRecording, let raw = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+        // The suspended flag (AVAudioSessionInterruptionWasSuspendedKey) is only set
+        // on the delayed interruption iOS posts when a suspended app resumes: seeing
+        // it means the process had ALREADY been suspended when the audio stopped —
+        // i.e. the lock-screen kill happened before this notification, not because
+        // of it. That distinction is the point of logging it (2026-11-22 field hunt).
+        let wasSuspended = (n.userInfo?[AVAudioSessionInterruptionWasSuspendedKey] as? Bool) ?? false
         if type == .began {
             guard !held else { return }
             held = true
@@ -325,18 +338,26 @@ final class Recorder: NSObject, ObservableObject {
             level = 0
             suspendRecognition()
             engine?.pause()
-            debugLog("recorder: interruption began")
+            debugLog("recorder: interruption began wasSuspended=\(wasSuspended)")
             return
         }
         // Interruption ended: only resume when the system says it's ours to take.
         let optionsRaw = n.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
         let shouldResume = AVAudioSession.InterruptionOptions(rawValue: optionsRaw).contains(.shouldResume)
-        debugLog("recorder: interruption ended shouldResume=\(shouldResume)")
+        debugLog("recorder: interruption ended shouldResume=\(shouldResume) wasSuspended=\(wasSuspended)")
         guard held else { return }
         held = false
         resumeWhenActive = true
         paused = true
-        if shouldResume && !appInBackground {
+        // Resume in the background too (2026-11-22 field report: lock-screen kill
+        // ~5 s). The old `!appInBackground` guard left the engine paused when the
+        // interruption ended behind the lock screen — a background-audio app with
+        // no running audio I/O is suspended by the system within seconds, which
+        // is exactly the reported kill. Resuming an input graph the app already
+        // owned in the foreground is permitted with the audio background mode
+        // (only STARTING one fresh in the background is not); if the system
+        // still refuses, the catch keeps the deferred-foreground path as before.
+        if shouldResume {
             do { try resume() }
             catch {
                 // Keep the file open if the system still refuses input; activation retries.
@@ -354,12 +375,20 @@ final class Recorder: NSObject, ObservableObject {
     /// engine itself (it re-reads the route); our job is to notice and re-tap.
     private func routeChanged() {
         guard isRecording, !held, !(engine?.isRunning ?? false) else { return }
-        if appInBackground {
-            // iOS may reject a new input I/O graph while the app is backgrounded.
-            // Keep the session/recording alive and retry from didBecomeActive.
+        // Not .active covers both .background and the lock transition's .inactive
+        // window (2026-11-22 field report: lock-screen kill ~5 s). A fresh input
+        // I/O graph cannot be created while the app is inactive/backgrounded —
+        // engine.start() fails there — and the old failure path called
+        // recordingLost, which stops() and deactivates the session. The app then
+        // sits in the background with no audio at all and is suspended within
+        // seconds: exactly the reported kill. So behind the lock screen a route
+        // change keeps the recording (paused, recovered on activation); losing
+        // the route's audio is survivable, killing the only active audio
+        // session is not.
+        if UIApplication.shared.applicationState != .active {
+            debugLog("recorder: route changed while not active; deferring engine restart")
             paused = true
             resumeWhenActive = true
-            debugLog("recorder: route changed in background; deferring engine restart")
             return
         }
         debugLog("recorder: engine configuration changed, restarting")
