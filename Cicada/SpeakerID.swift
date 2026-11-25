@@ -112,8 +112,10 @@ final class Voiceprints: @unchecked Sendable {
             try FileManager.default.moveItem(at: compiled, to: cache)
         }
         let config = MLModelConfiguration()
-        // Variable-length input doesn't compile for the Neural Engine; the GPU path is quick enough.
-        config.computeUnits = .cpuAndGPU
+        // Variable-length input doesn't compile for the Neural Engine. CPU only, not the GPU: iOS
+        // kills an app that submits GPU work in the background, and a recording keeps embedding
+        // voice segments with the screen locked (killed ~5 s after locking, at the first segment).
+        config.computeUnits = .cpuOnly
         return Voiceprints(model: try MLModel(contentsOf: cache, configuration: config))
     }
 
