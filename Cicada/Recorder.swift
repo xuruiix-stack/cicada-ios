@@ -541,6 +541,11 @@ final class Recorder: NSObject, ObservableObject {
 
     /// Segments closed so far, taken and cleared (AppModel reads on each arrive).
     func takeVoiceSegments() -> [VoiceSegment] {
+        // Never assign when empty: @Published fires objectWillChange on every set, and
+        // AppModel drains on that very signal, so an unconditional `= []` re-arms the
+        // drain forever. That loop pinned the main thread at ~100% CPU; in the
+        // background iOS kills the app for it (cpu_resource_fatal, ~5-9 s after locking).
+        guard !voiceSegments.isEmpty else { return [] }
         let out = voiceSegments
         voiceSegments = []
         return out
