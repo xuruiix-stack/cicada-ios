@@ -63,7 +63,22 @@ enum AISettings {
 }
 
 enum Keychain {
+    /// AfterFirstUnlock, not the default WhenUnlocked: a recording keeps calling the AI
+    /// service with the screen locked, and a WhenUnlocked key is unreadable ~10 s after locking.
+    private static let accessible = kSecAttrAccessibleAfterFirstUnlock
+    private static var migrated = false
+
+    /// Items saved by earlier builds carry the default class; move them once per launch.
+    private static func migrateIfNeeded() {
+        guard !migrated else { return }
+        migrated = true
+        let q = [kSecClass as String: kSecClassGenericPassword,
+                 kSecAttrService as String: "com.wquguru.cicada"] as [String: Any]
+        SecItemUpdate(q as CFDictionary, [kSecAttrAccessible as String: accessible] as CFDictionary)
+    }
+
     static func string(for key: String) -> String? {
+        migrateIfNeeded()
         var q = [kSecClass as String: kSecClassGenericPassword,
                  kSecAttrAccount as String: key,
                  kSecAttrService as String: "com.wquguru.cicada"] as [String: Any]
@@ -79,9 +94,11 @@ enum Keychain {
                                    kSecAttrAccount as String: key,
                                    kSecAttrService as String: "com.wquguru.cicada"]
         if SecItemCopyMatching((base as [String: Any]) as CFDictionary, nil) == errSecSuccess {
-            SecItemUpdate(base as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+            SecItemUpdate(base as CFDictionary, [kSecValueData as String: data,
+                                                 kSecAttrAccessible as String: accessible] as CFDictionary)
         } else {
             var add = base; add[kSecValueData as String] = data
+            add[kSecAttrAccessible as String] = accessible
             SecItemAdd(add as CFDictionary, nil)
         }
     }
