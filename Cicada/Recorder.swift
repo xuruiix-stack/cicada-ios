@@ -60,6 +60,10 @@ final class Recorder: NSObject, ObservableObject {
     private var resumeWhenActive = false
     /// The media server reset and rebuilding the input graph must wait for foreground.
     private var engineRecoveryPending = false
+    /// Background recovery after an interruption: retries until the mic is back, kept
+    /// alive by a background task (without running audio I/O iOS suspends us in ~5 s).
+    private var recoveryTimer: Timer?
+    private var recoveryGrant: UIBackgroundTaskIdentifier = .invalid
     private var recognizer: SFSpeechRecognizer?
     private let recognitionLock = NSLock()
     private var request: SFSpeechAudioBufferRecognitionRequest?
@@ -358,15 +362,67 @@ final class Recorder: NSObject, ObservableObject {
         // (only STARTING one fresh in the background is not); if the system
         // still refuses, the catch keeps the deferred-foreground path as before.
         if shouldResume {
-            do { try resume() }
-            catch {
-                // Keep the file open if the system still refuses input; activation retries.
-                debugLog("recorder: resume deferred: \(error.localizedDescription)")
-                if UIApplication.shared.applicationState == .active { appBecameActive() }
-            }
+            resumeAfterInterruption()
         } else if !appInBackground {
             appBecameActive()
         }
+    }
+
+    /// 2026-11-27 field report: a phone call 7 min in; when it ended behind the lock
+    /// screen, setActive failed with '!int' (-12985: a NON-mixable session may not
+    /// interrupt others from the background), the engine stayed down and iOS suspended
+    /// the app 5 s later — the rest of a 2.5 h meeting was never recorded. In the
+    /// background the session is now re-activated as mixable (allowed there), and a
+    /// refusal is retried every second under a background task instead of given up.
+    private func resumeAfterInterruption() {
+        endRecovery()
+        if tryResume(attempt: 0) { return }
+        recoveryGrant = UIApplication.shared.beginBackgroundTask(withName: "cicada-resume") { [weak self] in
+            self?.endRecovery()
+        }
+        var attempt = 0
+        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            attempt += 1
+            guard self.isRecording, !self.held else { self.endRecovery(); return }
+            if self.tryResume(attempt: attempt) { self.endRecovery(); return }
+            if attempt >= 25 {
+                debugLog("recorder: background resume gave up after \(attempt) tries; waiting for foreground")
+                self.endRecovery()
+            }
+        }
+        recoveryTimer = t
+        RunLoop.main.add(t, forMode: .common)
+    }
+
+    private func tryResume(attempt: Int) -> Bool {
+        let mixable = UIApplication.shared.applicationState != .active
+        do {
+            try resume(mixable: mixable)
+            if attempt > 0 || mixable { debugLog("recorder: resumed on attempt \(attempt) mixable=\(mixable)") }
+            return true
+        } catch {
+            paused = true
+            resumeWhenActive = true
+            debugLog("recorder: resume attempt \(attempt) failed (mixable=\(mixable)): \((error as NSError).code) \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func endRecovery() {
+        recoveryTimer?.invalidate(); recoveryTimer = nil
+        if recoveryGrant != .invalid {
+            UIApplication.shared.endBackgroundTask(recoveryGrant)
+            recoveryGrant = .invalid
+        }
+    }
+
+    /// Mixable is what a background app may activate; foreground keeps the normal one.
+    private func activateSession(mixable: Bool) throws {
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playAndRecord, mode: .measurement,
+                                options: mixable ? [.defaultToSpeaker, .mixWithOthers] : [.defaultToSpeaker])
+        try session.setActive(true)
     }
 
     /// A route change with no interruption in flight: the engine stopped on a
@@ -432,11 +488,9 @@ final class Recorder: NSObject, ObservableObject {
         }
     }
 
-    private func rebuildEngine() throws {
+    private func rebuildEngine(mixable: Bool = false) throws {
         let newEngine = AVAudioEngine()
-        let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker])
-        try session.setActive(true)
+        try activateSession(mixable: mixable)
         engine = newEngine
         // Follow configuration changes on the replacement engine as well.
         let token = NotificationCenter.default.addObserver(
@@ -454,12 +508,10 @@ final class Recorder: NSObject, ObservableObject {
     /// format the route now has (upstream RoomAudio.resume): re-activate the
     /// session, and re-tap the input when the engine is down. The file keeps
     /// its 16 kHz format; only the tap's input format can change.
-    private func resume() throws {
-        let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker])
-        try session.setActive(true)
+    private func resume(mixable: Bool = false) throws {
+        try activateSession(mixable: mixable)
         if engineRecoveryPending || engine == nil {
-            try rebuildEngine()
+            try rebuildEngine(mixable: mixable)
         } else if let engine, !engine.isRunning {
             try tapAndStart(engine: engine)
         }
@@ -668,6 +720,7 @@ final class Recorder: NSObject, ObservableObject {
         task = nil
         recognitionLock.unlock()
         timer?.invalidate(); timer = nil
+        endRecovery()
         observers.forEach(NotificationCenter.default.removeObserver); observers = []
         engine?.inputNode.removeTap(onBus: 0); engine?.stop(); engine = nil; converter = nil
         held = false; resumeWhenActive = false; engineRecoveryPending = false
